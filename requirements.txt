@@ -1,0 +1,13 @@
+# 运行本体只依赖 Python 标准库（tkinter），以下均为可选/开发依赖。
+
+# 打包 exe（打包exe.bat 会自动安装）
+pyinstaller>=6.0
+
+# 「用 Outlook 打开邮件」按钮所需；不装也能用「复制 HTML」粘贴到 Outlook
+pywin32>=306 ; sys_platform == "win32"
+
+# 生成 Logo（make_logo.py）
+pillow>=10.0
+
+# 开发：跑单元测试
+pytest>=8.0
