@@ -109,6 +109,7 @@ class WorkLogApp:
         self.lbl_header.pack(side="left")
         ttk.Button(top, text="周设置", command=self.open_week_setup).pack(side="right", padx=(8, 0))
         ttk.Button(top, text="📅 历史记录", command=self.open_history).pack(side="right")
+        ttk.Button(top, text="🔍 搜索", command=self.open_search).pack(side="right", padx=(8, 0))
 
         # ---- 次标头：当前日期 / 周几 / 第几个工作日 ----
         sub = ttk.Frame(self.root, padding=(10, 4))
@@ -285,7 +286,7 @@ class WorkLogApp:
         if not prev_keys:
             return 0
         prev = self.data["weeks"][prev_keys[-1]]
-        carry = report.unfinished_items(prev)
+        carry = report.unfinished_items(prev, self.data)
         if not carry:
             return 0
         week = storage.get_week(self.data, key)
@@ -824,6 +825,205 @@ class WorkLogApp:
         ttk.Button(btns, text="删除整周", command=delete_week).pack(side="left", padx=(8, 0))
         lb.bind("<Double-Button-1>", lambda e: go())
 
+    # ---------- 搜索 ----------
+
+    def open_search(self):
+        """搜索对话框：对历史与当前全部记录做模糊搜索，双击/回车跳转到对应日期。"""
+        self.collect_and_save()
+        f = self._font_family
+        win = tk.Toplevel(self.root)
+        win.title("搜索记录（历史 + 当前）")
+        win.transient(self.root)
+        win.grab_set()
+        win.geometry("720x560")
+        win.minsize(560, 420)
+
+        top = ttk.Frame(win, padding=(10, 8, 10, 0))
+        top.pack(fill="x")
+        ttk.Label(top, text="关键词：").pack(side="left")
+        var_q = tk.StringVar()
+        entry = tk.Entry(top, textvariable=var_q, font=(f, 10))
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        lbl_count = ttk.Label(top, text="", foreground="#595959")
+        lbl_count.pack(side="right")
+
+        ttk.Label(win,
+                  text="模糊匹配工作内容 / 难点备注 / 状态 / 下周计划；"
+                       "空格分隔多个关键词（须全部命中）。",
+                  foreground="#9e9e9e", padding=(10, 2, 10, 2)).pack(fill="x")
+
+        body = ttk.Frame(win, padding=(10, 4))
+        body.pack(fill="both", expand=True)
+        txt = tk.Text(body, font=(f, 10), wrap="word", state="disabled",
+                      background="#ffffff", cursor="arrow")
+        scroll = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=scroll.set)
+        txt.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        txt.tag_configure("hit", background="#ffe58f")     # 命中的关键词
+        txt.tag_configure("week", font=(f, 9, "bold"), foreground="#3F51B1")
+        txt.tag_configure("day", font=(f, 9, "bold"), foreground="#595959")
+        txt.tag_configure("plan", foreground="#1f4e79")
+        txt.tag_configure("sel", background="#cce5ff")     # 选中的行
+        st_tags = {}
+        for i, st in enumerate(report.STATUS_TEXT_COLORS):
+            tag = f"st{i}"
+            txt.tag_configure(tag, foreground=report.STATUS_TEXT_COLORS[st],
+                              font=(f, 10, "bold"))
+            st_tags[st] = tag
+
+        closed = [False]
+        line_no = 0
+        mapping = []   # (行号, week_key, 日期或 None, kind)
+        selected = {"line": None}
+
+        def next_line():
+            nonlocal line_no
+            line_no += 1
+            return line_no
+
+        def render():
+            nonlocal line_no
+            q = var_q.get().strip()
+            kws = [k for k in q.casefold().split() if k]
+            txt.config(state="normal")
+            txt.delete("1.0", "end")
+            mapping.clear()
+            line_no = 0
+            selected["line"] = None
+            txt.tag_remove("sel", "1.0", "end")
+
+            def add_hits(ln, line_text):
+                low = line_text.casefold()
+                for kw in kws:
+                    pos = low.find(kw)
+                    while pos != -1:
+                        txt.tag_add("hit", f"{ln}.{pos}", f"{ln}.{pos + len(kw)}")
+                        pos = low.find(kw, pos + len(kw))
+
+            results = report.search_items(self.data, q)
+            if not q:
+                txt.insert("end", "输入关键词开始搜索。\n")
+                lbl_count.config(text="")
+                txt.config(state="disabled")
+                return
+            if not results:
+                txt.insert("end", f"没有找到与「{q}」相关的记录。\n")
+                lbl_count.config(text="0 条")
+                txt.config(state="disabled")
+                return
+            n_item = sum(1 for r in results if r["kind"] == "item")
+            n_plan = len(results) - n_item
+            lbl_count.config(text=f"{n_item} 条记录" + (f"，{n_plan} 条计划" if n_plan else ""))
+            last_week = None
+            last_day = None
+            for r in results:
+                if r["week_key"] != last_week:
+                    last_week, last_day = r["week_key"], None
+                    ln = next_line()
+                    suffix = "（当前周）" if r["week_key"] == self.week_key else ""
+                    txt.insert("end", f"▍ {r['week_label']}{suffix}\n", "week")
+                    mapping.append((ln, r["week_key"], None, "week"))
+                if r["kind"] == "plan":
+                    ln = next_line()
+                    line_text = f"    四、下周计划：{report._flat(r['plan'])}"
+                    txt.insert("end", line_text + "\n", "plan")
+                    add_hits(ln, line_text)
+                    mapping.append((ln, r["week_key"], None, "plan"))
+                    continue
+                if r["date"] != last_day:
+                    last_day = r["date"]
+                    ln = next_line()
+                    txt.insert("end", f"  {storage.short_date(r['date'])} "
+                                     f"{storage.weekday_cn(r['date'])}\n", "day")
+                    mapping.append((ln, r["week_key"], r["date"], "day"))
+                content = (r["item"].get("content") or "").strip() or "（未填写内容）"
+                status = r["item"].get("status") or "未开始"
+                diff = (r["item"].get("difficulty") or "").strip()
+                prefix = f"    {r['seq']}. {report._flat(content)} —— "
+                line_text = prefix + status + (f"【难点：{report._flat(diff)}】" if diff else "")
+                ln = next_line()
+                txt.insert("end", prefix)
+                txt.insert("end", status, st_tags[status])
+                if diff:
+                    txt.insert("end", f"【难点：{report._flat(diff)}】")
+                txt.insert("end", "\n")
+                add_hits(ln, line_text)
+                mapping.append((ln, r["week_key"], r["date"], "item"))
+            txt.config(state="disabled")
+            # 默认选中第一条记录，回车即可跳转
+            first = next((m for m in mapping if m[3] == "item"),
+                         next((m for m in mapping if m[3] == "plan"), mapping[0]))
+            selected["line"] = first[0]
+            txt.tag_add("sel", f"{first[0]}.0", f"{first[0]}.0 lineend")
+
+        def find_target(ln):
+            tgt = None
+            for m in mapping:
+                if m[0] > ln:
+                    break
+                tgt = m
+            return tgt
+
+        def goto_line(ln):
+            tgt = find_target(ln)
+            if not tgt:
+                return
+            _, wk, dt, _kind = tgt
+            week = self.data["weeks"].get(wk)
+            wd = week.get("workdays", []) if week else []
+            if not wd:
+                self._status_msg("该周没有设置工作日，无法跳转。")
+                return
+            self.week_key = wk
+            if dt and dt in wd:
+                self.current_date = dt
+            elif self.current_date not in wd:
+                self.current_date = wd[0]
+            self.refresh_all()
+            self._status_msg(f"已跳转到 {storage.short_date(self.current_date)} "
+                             f"{storage.weekday_cn(self.current_date)}（搜索结果）")
+            close()
+
+        def jump_selected():
+            if selected["line"] is not None:
+                goto_line(selected["line"])
+
+        def on_click(event):
+            ln = int(txt.index(f"@{event.x},{event.y}").split(".")[0])
+            if not txt.get(f"{ln}.0", f"{ln}.0 lineend").strip():
+                return    # 空白行不可选
+            txt.tag_remove("sel", "1.0", "end")
+            txt.tag_add("sel", f"{ln}.0", f"{ln}.0 lineend")
+            selected["line"] = ln
+
+        def on_dbl(event):
+            ln = int(txt.index(f"@{event.x},{event.y}").split(".")[0])
+            if not txt.get(f"{ln}.0", f"{ln}.0 lineend").strip():
+                return
+            goto_line(ln)
+
+        def close():
+            if not closed[0]:
+                closed[0] = True
+                win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", close)
+        win.bind("<Escape>", lambda e: close())
+        win.bind("<Return>", lambda e: jump_selected())   # 对话框内任意位置回车均可跳转
+        win.bind("<Map>", lambda e: entry.focus_force())  # 窗口显示后强制焦点到输入框，打开即可输入
+        txt.bind("<Button-1>", on_click)
+        txt.bind("<Double-Button-1>", on_dbl)
+        var_q.trace_add("write", lambda *a: None if closed[0] else render())
+
+        btns = ttk.Frame(win, padding=(10, 0, 10, 8))
+        btns.pack(fill="x")
+        ttk.Button(btns, text="跳转到选中记录（回车）", command=jump_selected).pack(side="left")
+        ttk.Button(btns, text="关闭", command=close).pack(side="left", padx=(8, 0))
+
+        render()
+        entry.focus_set()
+
     # ---------- 周报 ----------
 
     def open_report(self):
@@ -862,7 +1062,7 @@ class ReportDialog:
         top = ttk.Frame(self.win, padding=(10, 8, 10, 0))
         top.pack(fill="x")
         ttk.Label(top, text=report.report_title(week), font=(f, 12, "bold")).pack(anchor="w")
-        ttk.Label(top, text=report.overview_sentence(week), foreground="#595959").pack(
+        ttk.Label(top, text=report.overview_sentence(week, data), foreground="#595959").pack(
             anchor="w", pady=(2, 0))
 
         body = ttk.Frame(self.win, padding=(10, 6))
@@ -898,7 +1098,7 @@ class ReportDialog:
         某天一条都没解析出来（多半是格式被改坏了）会跳过该天、保留原记录。
         """
         text = self.txt.get("1.0", "end-1c")
-        info = report.plain_back_summary(self.week, text)
+        info = report.plain_back_summary(self.week, text, self.data)
         if info["items"]:
             tips = [f"将回写 {info['days']} 天共 {info['items']} 条记录（覆盖这些天的原有条目）。"]
             if info["skipped"]:
@@ -910,7 +1110,7 @@ class ReportDialog:
                 self._msg("已取消回写，记录未改动。")
                 return
             storage.snapshot("report_writeback")
-        n = report.apply_plain_back(self.week, text)
+        n = report.apply_plain_back(self.week, text, self.data)
         if n:
             self.week.pop("report_draft", None)  # 修改已进数据，草稿不再需要
             storage.save_data(self.data)
@@ -1041,6 +1241,33 @@ def run_smoke(data_dir):
     assert "已于" in report.build_html(app.data, fake_week), "HTML 明细缺关联注记"
     assert "已于" in report.build_plain(app.data, fake_week), "纯文本明细缺关联注记"
     assert "跨日关联测试事项" not in report.next_week_plan(fake_week), "已收尾事项不应进下周计划"
+    # 跨周关联：A 周「进行中」→ B 周「已完成」→ A 周报告归入已完成并注记（下周），B 周注记承接
+    cross_data = {"weeks": {
+        "2026-08-17": {"start_date": "2026-08-17", "workdays": ["2026-08-17"], "days": {
+            "2026-08-17": {"done": True, "items": [
+                {"content": "跨周关联事项", "status": "进行中", "difficulty": ""}]}}},
+        "2026-08-24": {"start_date": "2026-08-24", "workdays": ["2026-08-25"], "days": {
+            "2026-08-25": {"done": True, "items": [
+                {"content": "跨周关联事项", "status": "已完成", "difficulty": ""}]}}}}}
+    stats_a, _ = report.collect_stats(cross_data["weeks"]["2026-08-17"], cross_data)
+    assert stats_a["merged"] == {("2026-08-17", 0): "2026-08-25"}, stats_a["merged"]
+    assert stats_a["done"] == 1 and stats_a["doing"] == 0, stats_a
+    stats_b, _ = report.collect_stats(cross_data["weeks"]["2026-08-24"], cross_data)
+    assert stats_b["carried"] == {("2026-08-25", 0): "2026-08-17"}, stats_b["carried"]
+    html_a = report.build_html(cross_data, cross_data["weeks"]["2026-08-17"])
+    assert "已于 2026.08.25 完成，下周" in html_a, "HTML 缺跨周完成注记"
+    html_b = report.build_html(cross_data, cross_data["weeks"]["2026-08-24"])
+    assert "承接 2026.08.17，上周" in html_b, "HTML 缺跨周承接注记"
+    assert "跨周关联事项" not in report.next_week_plan(
+        cross_data["weeks"]["2026-08-17"], cross_data), "跨周已收尾事项不应进下周计划"
+    # 搜索：模糊匹配内容/状态，结果按周从新到旧
+    hits = report.search_items(cross_data, "跨周关联")
+    assert len(hits) == 2, hits
+    assert hits[0]["week_key"] == "2026-08-24" and hits[1]["week_key"] == "2026-08-17", hits
+    assert hits[0]["kind"] == "item" and hits[0]["date"] == "2026-08-25"
+    assert report.search_items(cross_data, "跨周 已完成")[0]["item"]["status"] == "已完成"
+    assert report.search_items(cross_data, "没有这个东西") == []
+    assert report.search_items(cross_data, "") == []
     # 预览文本解析回写：修改内容后应写回数据（HTML 版同步生效）
     fake_plain = report.build_plain(app.data, fake_week)
     changed = fake_plain.replace("跨日关联测试事项", "跨日关联测试事项（升级版）")

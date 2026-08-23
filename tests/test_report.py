@@ -77,6 +77,126 @@ def test_统计不会往数据里写入空的日期条目():
     assert "2026-08-18" not in w["days"]
 
 
+# ---------- 跨周关联 ----------
+
+def make_data(*weeks):
+    """把 make_week 产出的周拼成 data 结构（key 取周的 start_date）。"""
+    return {"settings": {"reporter": ""},
+            "weeks": {w["start_date"]: w for w in weeks}}
+
+
+def test_跨周关联_上周进行中下周完成算已完成():
+    wa = make_week({"2026-08-17": [item("跨周事项", "进行中")]})
+    wb = make_week({"2026-08-25": [item("跨周事项", "已完成")]})
+    data = make_data(wa, wb)
+    stats, _ = report.collect_stats(wa, data)
+    assert stats["merged"] == {("2026-08-17", 0): "2026-08-25"}
+    assert stats["done"] == 1 and stats["doing"] == 0
+    assert "跨周事项" not in report.next_week_plan(wa, data)
+    assert "已于 2026.08.25 完成，下周" in report.build_html(data, wa)
+    assert "（已于 2026.08.25 完成，下周）" in report.build_plain(data, wa)
+
+
+def test_跨周关联_反向注记承接():
+    wa = make_week({"2026-08-17": [item("跨周事项", "进行中")]})
+    wb = make_week({"2026-08-25": [item("跨周事项", "已完成")]})
+    data = make_data(wa, wb)
+    stats, _ = report.collect_stats(wb, data)
+    assert stats["carried"] == {("2026-08-25", 0): "2026-08-17"}
+    assert "承接 2026.08.17，上周" in report.build_html(data, wb)
+    assert "（承接 2026.08.17，上周）" in report.build_plain(data, wb)
+
+
+def test_跨周关联_不传data时保持只关联同周():
+    wa = make_week({"2026-08-17": [item("跨周事项", "进行中")]})
+    stats, _ = report.collect_stats(wa)
+    assert stats["merged"] == {} and stats["carried"] == {}
+    assert stats["doing"] == 1
+
+
+def test_跨周关联_取最早完成与最早开始():
+    wa = make_week({"2026-08-17": [item("跨周事项", "进行中")]})
+    wb = make_week({"2026-08-24": [item("跨周事项", "进行中")],
+                    "2026-08-25": [item("跨周事项", "进行中")]})
+    wc = make_week({"2026-08-31": [item("跨周事项", "进行中")],
+                    "2026-09-02": [item("跨周事项", "已完成")]})
+    data = make_data(wa, wb, wc)
+    stats_a, _ = report.collect_stats(wa, data)
+    assert stats_a["merged"] == {("2026-08-17", 0): "2026-09-02"}
+    assert "已于 2026.09.02 完成，后 2 周" in report.build_html(data, wa)
+    stats_c, _ = report.collect_stats(wc, data)
+    assert stats_c["carried"] == {("2026-09-02", 0): "2026-08-17"}
+    assert "承接 2026.08.17，前 2 周" in report.build_html(data, wc)
+
+
+def test_跨周关联_同周内完成优先于跨周完成():
+    """本周后续已完成时按同周日期注记，不取更晚周的完成日期。"""
+    wa = make_week({"2026-08-17": [item("跨周事项", "进行中")],
+                    "2026-08-19": [item("跨周事项", "已完成")]})
+    wb = make_week({"2026-08-25": [item("跨周事项", "已完成")]})
+    data = make_data(wa, wb)
+    stats, _ = report.collect_stats(wa, data)
+    assert stats["merged"] == {("2026-08-17", 0): "2026-08-19"}
+    assert "，下周" not in report.build_html(data, wa)  # 同周完成，不注「下周」
+
+
+def test_week_gap_label():
+    w = {"start_date": "2026-08-17"}
+    assert report.week_gap_label(w, "2026-08-19") == ""
+    assert report.week_gap_label(w, "2026-08-24") == "下周"
+    assert report.week_gap_label(w, "2026-09-02") == "后 2 周"
+    assert report.week_gap_label(w, "2026-08-14") == "上周"
+    assert report.week_gap_label(w, "2026-08-07") == "前 2 周"
+    assert report.week_gap_label(w, "不是日期") == ""
+
+
+# ---------- 搜索 ----------
+
+def test_搜索_模糊匹配内容与多关键词():
+    data = make_data(make_week({
+        "2026-08-17": [item("支付接口联调", "进行中", "验签报错")],
+        "2026-08-18": [item("登录模块开发", "已完成")]}))
+    hits = report.search_items(data, "联调")
+    assert len(hits) == 1 and hits[0]["date"] == "2026-08-17"
+    assert len(report.search_items(data, "支付 联调")) == 1    # 多词 AND
+    assert report.search_items(data, "支付 登录") == []         # 须全部命中
+
+
+def test_搜索_难点与状态也能搜到():
+    data = make_data(make_week({
+        "2026-08-17": [item("联调支付", "进行中", "验签报错\n等供应商回复")]}))
+    assert len(report.search_items(data, "验签")) == 1
+    assert report.search_items(data, "已完成") == []
+    assert len(report.search_items(data, "进行中")) == 1
+
+
+def test_搜索_大小写不敏感():
+    data = make_data(make_week({"2026-08-17": [item("API 接口对接", "已完成")]}))
+    assert len(report.search_items(data, "api")) == 1
+    assert len(report.search_items(data, "API")) == 1
+
+
+def test_搜索_下周计划也能搜到():
+    data = make_data(make_week({"2026-08-17": [item("写方案", "进行中")]},
+                               plan="下周推进数据迁移"))
+    hits = report.search_items(data, "数据迁移")
+    assert len(hits) == 1 and hits[0]["kind"] == "plan"
+
+
+def test_搜索_结果按周从新到旧():
+    data = make_data(
+        make_week({"2026-08-17": [item("重复事项", "进行中")]}),
+        make_week({"2026-08-24": [item("重复事项", "已完成")]}))
+    hits = report.search_items(data, "重复事项")
+    assert [h["week_key"] for h in hits] == ["2026-08-24", "2026-08-17"]
+
+
+def test_搜索_空关键词返回空():
+    data = make_data(make_week({"2026-08-17": [item("A")]}))
+    assert report.search_items(data, "  ") == []
+    assert report.search_items(data, "") == []
+
+
 # ---------- 下周计划 ----------
 
 def test_下周计划自动草拟去重():
