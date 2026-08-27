@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['C:/Users/zhang/Desktop/Deepseek/Project/Work Log/worklog.py'],
+    ['C:/Users/zhang/Desktop/Project/claude/Work_log/worklog.py'],
     pathex=[],
     binaries=[],
     datas=[('logo.ico', '.'), ('logo_64.png', '.')],
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:/Users/zhang/Desktop/Deepseek/Project/Work Log/logo.ico'],
+    icon=['C:/Users/zhang/Desktop/Project/claude/Work_log/logo.ico'],
 )
