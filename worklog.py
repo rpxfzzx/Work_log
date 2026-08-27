@@ -1238,6 +1238,16 @@ def run_smoke(data_dir):
     assert stats["unique"]["total"] == 1 and stats["unique"]["done"] == 1, stats["unique"]
     assert "推进事项 1 项" in report.overview_sentence(fake_week), \
         report.overview_sentence(fake_week)
+    # 同名「已完成」重复记录：完成数按条数计，不合并成一例
+    dup_week = {"start_date": "2026-08-17", "workdays": ["2026-08-17", "2026-08-18"], "days": {
+        "2026-08-17": {"done": True, "items": [
+            {"content": "重复完成事项", "status": "已完成", "difficulty": ""}]},
+        "2026-08-18": {"done": True, "items": [
+            {"content": "重复完成事项", "status": "已完成", "difficulty": ""}]}}}
+    dup_stats, _ = report.collect_stats(dup_week)
+    assert dup_stats["unique"] == {"total": 2, "done": 2, "doing": 0, "todo": 0}, dup_stats["unique"]
+    assert "已完成 2 项" in report.overview_sentence(dup_week), \
+        report.overview_sentence(dup_week)
     assert "已于" in report.build_html(app.data, fake_week), "HTML 明细缺关联注记"
     assert "已于" in report.build_plain(app.data, fake_week), "纯文本明细缺关联注记"
     assert "跨日关联测试事项" not in report.next_week_plan(fake_week), "已收尾事项不应进下周计划"

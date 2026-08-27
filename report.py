@@ -112,8 +112,10 @@ def collect_stats(week, data=None):
 
     stats 字段：
       total/done/doing/todo/diff/filled —— 按「记录条数」计数；
-      unique —— 按「事项」去重后的计数 {total/done/doing/todo}，
-                 同一内容跨多天记录只算一项，状态取跨天最高（已完成 > 进行中 > 未开始）；
+      unique —— 「事项」计数 {total/done/doing/todo}：
+                 「已完成」条目按记录条数计，同名重复各算一项、不合并；
+                 未完成的同名条目合并为一例，状态取最高（进行中 > 未开始）；
+                 条目若之后（本周或更晚的周）出现同内容「已完成」，并入完成、不另算；
       merged —— {(日期, 条目序号): 完成日期}，即已收尾的「进行中」事项映射（完成日期可能在其他周）；
       carried —— {(日期, 条目序号): 起始日期}，即承接之前周「进行中」的「已完成」事项映射。
     difficulties: [(日期, 工作内容, 难点描述), ...]
@@ -143,7 +145,9 @@ def collect_stats(week, data=None):
     cross_done = _later_done_dates(data, week) if data is not None else {}
     prev_doing = _earlier_doing_dates(data, week) if data is not None else {}
     # 第二遍：统计；「进行中」条目若同内容在之后某天（同周或更晚的周）已完成 → 归入已完成
-    uniq = {}   # 事项 key -> 合并后的状态
+    done_unique = 0    # 原状态即「已完成」的条目：同名重复各算一项，不合并
+    cross_merged = {}  # 仅跨周收尾（本周无「已完成」记录）的「进行中」：同名合并为一例
+    uniq = {}          # 其余未完成条目：同名合并为一例，状态取最高
     for d in workdays:
         day = storage.peek_day(week, d)
         if day.get("done"):
@@ -170,26 +174,40 @@ def collect_stats(week, data=None):
                 stats["doing"] += 1
             else:
                 stats["todo"] += 1
-            # 去重口径：同内容视为一个事项；内容为空的条目各算一项（无法归并）
-            key = c if c else ("\x00blank", d, i)
-            prev = uniq.get(key)
-            if prev is None or _STATUS_RANK[s] > _STATUS_RANK[prev]:
-                uniq[key] = s
+            # 去重口径：
+            # - 「已完成」条目按记录条数计，同名重复各算一项；
+            # - 未完成的同名条目合并为一例，状态取最高；若之后出现同内容「已完成」则并入完成。
+            key = c if c else ("\x00blank", d, i)  # 内容为空的条目各算一项（无法归并）
+            if (it.get("status") or "未开始") == "已完成":
+                done_unique += 1
+                uniq.pop(key, None)
+            elif merged:
+                if c in done_dates:   # 本周有「已完成」记录 → 并入该条，不另算
+                    uniq.pop(key, None)
+                else:                 # 完成在更晚的周 → 本周按一例「已完成」计
+                    cross_merged.setdefault(key, None)
+                    uniq.pop(key, None)
+            else:
+                prev = uniq.get(key)
+                if prev is None or _STATUS_RANK[s] > _STATUS_RANK[prev]:
+                    uniq[key] = s
             diff = (it.get("difficulty") or "").strip()
             if diff:
                 stats["diff"] += 1
                 diffs.append((d, (it.get("content") or "").strip(), diff))
     u = stats["unique"]
-    u["total"] = len(uniq)
+    u["done"] = done_unique + len(cross_merged)
     for s in uniq.values():
-        u["done" if s == "已完成" else ("doing" if s == "进行中" else "todo")] += 1
+        u["doing" if s == "进行中" else "todo"] += 1
+    u["total"] = u["done"] + u["doing"] + u["todo"]
     return stats, diffs
 
 
 def overview_sentence(week, data=None):
     """'本周共 5 个工作日，推进事项 4 项：已完成 2 项，进行中 1 项，未开始 1 项（共记录 7 条明细）；记录难点 2 条。'
 
-    注意统计口径：同一件事跨多天记录只算「1 项」，避免概述数字虚高；
+    注意统计口径：同名「已完成」条目按记录条数各算一项，不合并；
+    未完成的同名条目合并为一例，进行中事项后续完成时并入完成；
     括号里的「条明细」才是逐日记录的条数。传入 data 时启用跨周关联口径。
     """
     stats, _ = collect_stats(week, data)

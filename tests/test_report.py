@@ -43,6 +43,31 @@ def test_跨日重复事项在概述中只算一项():
     assert "推进事项 1 项" in s and "已完成 1 项" in s and "共记录 3 条明细" in s
 
 
+def test_同名已完成条目按条数计不合并():
+    """同名「已完成」条目跨天重复记录时，完成数按记录条数各算一项。"""
+    w = make_week({
+        "2026-08-17": [item("整理周报", "已完成")],
+        "2026-08-18": [item("整理周报", "已完成")],
+        "2026-08-19": [item("整理周报", "进行中")],
+    })
+    stats, _ = report.collect_stats(w)
+    assert stats["unique"] == {"total": 3, "done": 2, "doing": 1, "todo": 0}
+    s = report.overview_sentence(w)
+    assert "已完成 2 项" in s and "进行中 1 项" in s
+
+
+def test_未开始到进行再到完成只算一例():
+    """未开始 → 进行中 → 已完成 的同名条目只算一例，计入已完成。"""
+    w = make_week({
+        "2026-08-17": [item("数据迁移", "未开始")],
+        "2026-08-18": [item("数据迁移", "进行中")],
+        "2026-08-19": [item("数据迁移", "已完成")],
+    })
+    stats, _ = report.collect_stats(w)
+    assert stats["unique"] == {"total": 1, "done": 1, "doing": 0, "todo": 0}
+    assert "已完成 1 项" in report.overview_sentence(w)
+
+
 def test_不同事项分别计数且条数与项数一致时不显示括号():
     w = make_week({"2026-08-17": [item("A", "已完成"), item("B", "未开始")]})
     stats, _ = report.collect_stats(w)
