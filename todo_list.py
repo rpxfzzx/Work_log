@@ -51,7 +51,8 @@ def save_items(items):
             seen.add(s)
             clean.append(s)
     os.makedirs(TODO_DIR, exist_ok=True)
-    tmp = TODO_FILE + ".tmp"
+    storage.cleanup_stale_tmp(TODO_FILE)
+    tmp = f"{TODO_FILE}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump({"items": clean}, f, ensure_ascii=False, indent=2)
         f.flush()

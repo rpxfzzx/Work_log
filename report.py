@@ -4,7 +4,9 @@
 周报结构参考主流周报模板：基本信息 → 本周工作概述 → 每日工作明细 → 难点与问题 → 下周计划。
 HTML 全部使用内联样式（无 class / 外部 CSS），保证复制粘贴到 Outlook 邮件正文不变形。
 """
+import hashlib
 import html as _html
+import logging
 import os
 import re
 import subprocess
@@ -371,7 +373,9 @@ def build_html(data, week, full_document=False):
 # ---------- 纯文本生成 ----------
 
 _DATE_HEAD_RE = re.compile(r"^(\d{4})[-.](\d{1,2})[-.](\d{1,2})")
-_ITEM_RE = re.compile(r"^(\d+)[.、]\s*(.+?)\s*—+\s*([^\s【（]+)(.*)$")
+# 内容部分贪婪匹配：分隔符取「最后一个」——，避免工作内容本身含破折号（如“修复 A——B”）
+# 时被从中间截断；要求分隔符前有空白，减少把难点里的破折号误当分隔符。
+_ITEM_RE = re.compile(r"^(\d+)[.、]\s*(.+)\s+—+\s*([^\s【（]+)(.*)$")
 _DIFF_RE = re.compile(r"【难点：([^】]*)】")
 
 
@@ -482,14 +486,24 @@ def _parse_plain(week, text):
 def _restore_multiline_diff(new_items, old_items):
     """难点在纯文本里被压成单行（_flat），原样回写会丢换行。
 
-    逐条比对：用户没改动该条难点（压平后与原值一致）时，恢复原始多行文本。
+    按「工作内容」而不是按位置配对：用户在文本里删行、调序后，多行难点仍能
+    还原到原条目上。用户确实改了难点（压平后与原值不一致）时以修改为准。
     """
-    for i, it in enumerate(new_items):
-        if i >= len(old_items):
-            break
-        old = (old_items[i].get("difficulty") or "")
-        if old and _flat(old.strip()) == it.get("difficulty", ""):
-            it["difficulty"] = old
+    by_content = {}
+    for old in old_items:
+        c = _norm((old or {}).get("content") or "")
+        if c:
+            by_content.setdefault(c, []).append(old)
+    for it in new_items:
+        cands = by_content.get(_norm((it or {}).get("content") or ""))
+        if not cands:
+            continue
+        flat_new = (it.get("difficulty") or "").strip()
+        for old in cands:
+            old_diff = (old.get("difficulty") or "").strip()
+            if old_diff and _flat(old_diff) == flat_new:
+                it["difficulty"] = old_diff
+                break
 
 
 def plain_back_summary(week, text, data=None):
@@ -534,6 +548,26 @@ def apply_plain_back(week, text, data=None):
     if plan is not None and plan != next_week_plan(week, data):
         week["next_week_plan"] = plan
     return updated
+
+
+def week_fingerprint(data, week):
+    """周数据的稳定指纹（sha256 十六进制）。
+
+    保存周报草稿时记录，之后打开草稿前比对：不一致说明草稿保存后记录又被改过，
+    应提醒用户选择用草稿还是按当前记录重新生成，避免旧草稿悄悄覆盖新数据。
+    """
+    h = hashlib.sha256()
+    h.update(("\x00" + (get_reporter(data) or "")).encode("utf-8"))
+    h.update(("\x01" + ((week or {}).get("next_week_plan") or "")).encode("utf-8"))
+    for d in sorted((week or {}).get("workdays", [])):
+        day = storage.peek_day(week, d)
+        h.update(("\x02" + d).encode("utf-8"))
+        h.update(("\x03" + str(bool(day.get("done")))).encode("utf-8"))
+        for it in day.get("items", []):
+            h.update(("\x04" + ((it or {}).get("content") or "")).encode("utf-8"))
+            h.update(("\x05" + ((it or {}).get("status") or "")).encode("utf-8"))
+            h.update(("\x06" + ((it or {}).get("difficulty") or "")).encode("utf-8"))
+    return h.hexdigest()
 
 
 # ---------- 搜索 ----------
@@ -647,6 +681,7 @@ def _copy_cf_html(html):
             user32.CloseClipboard()
         return True
     except Exception:
+        logging.getLogger("worklog").warning("CF_HTML 剪贴板写入失败", exc_info=True)
         return False
 
 
@@ -656,7 +691,8 @@ def _copy_via_powershell(html):
     注意 -AsHtml 只存在于 Windows PowerShell 5.1；PowerShell 7 的 Set-Clipboard
     已移除该参数，所以这里显式调用 powershell.exe 而不是 pwsh，并在缺参数时给出明确提示。
     """
-    path = os.path.join(tempfile.gettempdir(), "_worklog_clip.html")
+    # 临时文件名带进程号，避免两个实例同时复制时互相覆盖
+    path = os.path.join(tempfile.gettempdir(), f"_worklog_clip_{os.getpid()}.html")
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(html)
@@ -669,11 +705,14 @@ def _copy_via_powershell(html):
             if "AsHtml" in err:
                 err = ("当前 PowerShell 不支持 Set-Clipboard -AsHtml"
                        "（该参数仅 Windows PowerShell 5.1 提供）。")
+            logging.getLogger("worklog").warning("PowerShell 剪贴板复制失败：%s",
+                                                 err or "执行失败")
             return err or "PowerShell 执行失败"
         return None
     except FileNotFoundError:
         return "未找到 powershell.exe"
     except Exception as e:
+        logging.getLogger("worklog").warning("PowerShell 剪贴板复制失败", exc_info=True)
         return str(e)
     finally:
         try:

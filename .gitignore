@@ -2,6 +2,7 @@
 build/
 dist/
 *.exe
+*.spec
 *.spec.bak
 
 # Python

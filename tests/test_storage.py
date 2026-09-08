@@ -36,7 +36,15 @@ def test_json损坏时备份为bad并重建(tmp_store):
     write_raw(tmp_store, "{不是合法 json")
     d = storage.load_data()
     assert d["weeks"] == {}
-    assert (tmp_store / "worklog.json.bad").exists()
+    assert list(tmp_store.glob("worklog.json.*.bad"))
+
+
+def test_坏数据备份保留多份且受限(tmp_store):
+    for _ in range(storage.BAD_KEEP + 2):
+        write_raw(tmp_store, "{坏 json")
+        storage.load_data()
+    files = list(tmp_store.glob("worklog.json.*.bad"))
+    assert len(files) == storage.BAD_KEEP
 
 
 @pytest.mark.parametrize("raw", [
@@ -71,8 +79,10 @@ def test_条目里的非字典项被丢弃(tmp_store):
 
 
 def test_周报草稿字段被保留(tmp_store):
-    write_raw(tmp_store, json.dumps({"weeks": {"2026-08-17": {"report_draft": "草稿"}}}))
-    assert storage.load_data()["weeks"]["2026-08-17"]["report_draft"] == "草稿"
+    write_raw(tmp_store, json.dumps({"weeks": {"2026-08-17": {
+        "report_draft": "草稿", "report_draft_fp": "abc"}}}))
+    w = storage.load_data()["weeks"]["2026-08-17"]
+    assert w["report_draft"] == "草稿" and w["report_draft_fp"] == "abc"
 
 
 # ---------- 写入 ----------
@@ -91,7 +101,14 @@ def test_保存后可原样读回并带版本号(tmp_store):
 
 def test_保存不留临时文件(tmp_store):
     storage.save_data(storage._empty_data())
-    assert not (tmp_store / "worklog.json.tmp").exists()
+    assert not list(tmp_store.glob("worklog.json.*.tmp"))
+
+
+def test_保存时清理历史进程残留的临时文件(tmp_store):
+    stale = tmp_store / "worklog.json.99999.tmp"
+    stale.write_text("x", encoding="utf-8")
+    storage.save_data(storage._empty_data())
+    assert not stale.exists()
 
 
 def test_快照可用于恢复(tmp_store):

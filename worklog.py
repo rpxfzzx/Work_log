@@ -3,15 +3,17 @@
 
 双击 启动工作日志.bat，或执行 python worklog.py 运行。
 """
+import copy
 import datetime
+import logging
 import os
 import re
 import sys
 import tkinter as tk
-import webbrowser
 import tkinter.font as tkfont
 from tkinter import messagebox, ttk
 
+import dialogs
 import report
 import storage
 import todo_list
@@ -58,6 +60,7 @@ class WorkLogApp:
         self.current_date = None   # 当前查看的日期字符串
         self.row_widgets = []      # 条目行控件列表
         self.selected_row = None   # 选中的行（用于“删除选中行”）
+        self._undo_stack = []      # 撤销栈：破坏性操作前的整份数据快照（最多 20 份）
         self._col_flex = (340, 260)  # 弹性列当前像素宽度（工作内容, 难点备注），随窗口宽度更新
 
         self._font_family = self._pick_font()
@@ -71,6 +74,7 @@ class WorkLogApp:
         root.bind("<Control-s>", lambda e: self.save_now(notify=True))
         root.bind("<Control-Return>", lambda e: (self.add_row(), "break")[1])
         root.bind("<Control-d>", lambda e: (self.delete_selected_row(), "break")[1])
+        root.bind("<Control-z>", lambda e: (self.undo(), "break")[1])
 
     # ---------- 初始化 ----------
 
@@ -87,9 +91,9 @@ class WorkLogApp:
         self.root.minsize(900, 620)
         style = ttk.Style()
         style.configure(".", font=(self._font_family, 10))
-        style.configure("StatusDone.TCombobox", foreground="#375623")
-        style.configure("StatusDoing.TCombobox", foreground="#1f4e79")
-        style.configure("StatusNone.TCombobox", foreground="#595959")
+        style.configure("StatusDone.TCombobox", foreground=report.STATUS_TEXT_COLORS["已完成"])
+        style.configure("StatusDoing.TCombobox", foreground=report.STATUS_TEXT_COLORS["进行中"])
+        style.configure("StatusNone.TCombobox", foreground=report.STATUS_TEXT_COLORS["未开始"])
         self._set_window_icon()
 
     def _set_window_icon(self):
@@ -206,7 +210,7 @@ class WorkLogApp:
         status.pack(fill="x")
         self.lbl_status = ttk.Label(status, text="就绪", foreground="#595959")
         self.lbl_status.pack(side="left")
-        ttk.Label(status, text="Ctrl+S 保存 · Ctrl+Enter 添加行 · Ctrl+D 删除选中行",
+        ttk.Label(status, text="Ctrl+S 保存 · Ctrl+Enter 添加行 · Ctrl+D 删除选中行 · Ctrl+Z 撤销",
                   foreground="#9e9e9e").pack(side="right")
 
     def _update_flex_columns(self, event=None):
@@ -235,16 +239,23 @@ class WorkLogApp:
     def week(self):
         return storage.get_week(self.data, self.week_key) if self.week_key else None
 
+    def _locate_view(self, key, today):
+        """该周存在且已设置工作日时，返回应显示的日期（今天优先，其次最近的工作日）；否则 None。"""
+        week = self.data["weeks"].get(key)
+        if not (week and week.get("workdays")):
+            return None
+        wd = week["workdays"]
+        today_s = storage.format_date(today)
+        return today_s if today_s in wd else (wd[-1] if today_s > wd[-1] else wd[0])
+
     def _select_initial_date(self, auto_setup):
         """启动时定位到今天；今天所在周未设置则弹周设置（auto_setup 时静默建默认周）。"""
         today = datetime.date.today()
         key = storage.format_date(storage.monday_of(today))
-        week = self.data["weeks"].get(key)
-        if week and week.get("workdays"):
-            wd = week["workdays"]
-            today_s = storage.format_date(today)
+        view = self._locate_view(key, today)
+        if view:
             self.week_key = key
-            self.current_date = today_s if today_s in wd else (wd[-1] if today_s > wd[-1] else wd[0])
+            self.current_date = view
             return
         if auto_setup:
             self._create_default_week(key, today)
@@ -255,12 +266,10 @@ class WorkLogApp:
     def _setup_week_interactive(self):
         today = datetime.date.today()
         key = storage.format_date(storage.monday_of(today))
-        week = self.data["weeks"].get(key)
-        if week and week.get("workdays"):
-            wd = week["workdays"]
-            today_s = storage.format_date(today)
+        view = self._locate_view(key, today)
+        if view:
             self.week_key = key
-            self.current_date = today_s if today_s in wd else (wd[-1] if today_s > wd[-1] else wd[0])
+            self.current_date = view
             self.refresh_all()
             return
         if not self.open_week_setup(default_date=today):
@@ -488,6 +497,7 @@ class WorkLogApp:
             rw["badge"].config(text=f"{i}.")
 
     def delete_row_by_ref(self, rw):
+        self._push_undo()
         self.row_widgets.remove(rw)
         rw["frame"].destroy()
         if self.selected_row is rw:
@@ -499,6 +509,11 @@ class WorkLogApp:
         if self.selected_row:
             self.delete_row_by_ref(self.selected_row)
         elif self.row_widgets:
+            # 没有选中行时删最后一行：加确认，防止误按 Ctrl+D 删错
+            if not messagebox.askyesno("删除确认",
+                                       "没有选中行，将删除最后一行。确认删除吗？（可 Ctrl+Z 撤销）",
+                                       parent=self.root):
+                return
             self.delete_row_by_ref(self.row_widgets[-1])
         else:
             self._status_msg("当前没有可删除的条目。")
@@ -508,6 +523,7 @@ class WorkLogApp:
         if not self.current_date:
             return
         self.collect_and_save()
+        self._push_undo()
         prev = storage.prev_workday(self.data, self.week_key, self.current_date)
         if not prev:
             self._status_msg("没有找到上一个工作日的记录。")
@@ -561,106 +577,31 @@ class WorkLogApp:
         self._autosize_text(txt_c)
         self.collect_and_save()
 
-    def open_todo_list(self):
-        """常用工作清单管理对话框：添加 / 删除 / 排序，保存到 todo_list-config 目录。"""
-        f = self._font_family
-        win = tk.Toplevel(self.root)
-        win.title("常用工作清单")
-        win.transient(self.root)
-        win.grab_set()
-        win.geometry("470x430")
-        win.minsize(430, 380)
-        win.resizable(True, True)
+    # ---------- 撤销 ----------
 
-        frm = ttk.Frame(win, padding=10)
-        frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text="常用工作（录入时点工作内容右侧 ▾ 或右键内容框选择）：").pack(anchor="w")
+    def _push_undo(self):
+        """破坏性操作（删行/删日/删周/改工作日/周报回写）前留一份整数据快照，供 Ctrl+Z 恢复。"""
+        self._undo_stack.append(copy.deepcopy(self.data))
+        if len(self._undo_stack) > 20:
+            self._undo_stack.pop(0)
 
-        box = ttk.Frame(frm)
-        box.pack(fill="both", expand=True, pady=6)
-        lb = tk.Listbox(box, font=(f, 10), activestyle="dotbox")
-        lb.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(box, command=lb.yview)
-        scroll.pack(side="right", fill="y")
-        lb.config(yscrollcommand=scroll.set)
-        for it in todo_list.load_items():
-            lb.insert("end", it)
-
-        row_add = ttk.Frame(frm)
-        row_add.pack(fill="x", pady=(0, 6))
-        var_new = tk.StringVar()
-        ent = tk.Entry(row_add, textvariable=var_new, font=(f, 10))
-        ent.pack(side="left", fill="x", expand=True)
-
-        def do_add():
-            s = var_new.get().strip()
-            if not s:
-                return
-            for i in range(lb.size()):
-                if lb.get(i) == s:
-                    lb.selection_clear(0, "end")
-                    lb.selection_set(i)
-                    lb.see(i)
-                    var_new.set("")
-                    return
-            lb.insert("end", s)
-            lb.see("end")
-            var_new.set("")
-
-        ttk.Button(row_add, text="添加", command=do_add).pack(side="left", padx=(8, 0))
-
-        row_btns = ttk.Frame(frm)
-        row_btns.pack(fill="x", pady=(0, 8))
-        ttk.Button(row_btns, text="上移", command=lambda: self._move_todo_item(lb, -1)).pack(side="left")
-        ttk.Button(row_btns, text="下移", command=lambda: self._move_todo_item(lb, 1)).pack(
-            side="left", padx=6)
-
-        def do_delete():
-            sel = lb.curselection()
-            if sel:
-                lb.delete(sel[0])
-
-        ttk.Button(row_btns, text="删除选中", command=do_delete).pack(side="left")
-
-        ttk.Label(frm, text=f"保存在：{todo_list.TODO_FILE}", foreground="#888888",
-                  font=(f, 8)).pack(anchor="w", pady=(0, 8))
-
-        row_ok = ttk.Frame(frm)
-        row_ok.pack(fill="x")
-        self._todo_saved_lbl = ttk.Label(row_ok, text="", foreground="#375623")
-
-        def do_save():
-            todo_list.save_items([lb.get(i) for i in range(lb.size())])
-            self._todo_saved_lbl.config(text=f"已保存 {lb.size()} 条")
-
-        def do_save_and_close():
-            todo_list.save_items([lb.get(i) for i in range(lb.size())])
-            win.destroy()
-            self._status_msg(f"常用工作清单已保存（{lb.size()} 条）")
-
-        ttk.Button(row_ok, text="保存", command=do_save).pack(side="left")
-        ttk.Button(row_ok, text="保存并关闭", command=do_save_and_close).pack(side="left", padx=6)
-        ttk.Button(row_ok, text="取消", command=win.destroy).pack(side="left", padx=(16, 8))
-        self._todo_saved_lbl.pack(side="left")
-        win.protocol("WM_DELETE_WINDOW", do_save_and_close)   # 点右上角 ✕ 也保存
-        win.bind("<Return>", lambda e: do_add())
-        ent.focus_set()
-
-    @staticmethod
-    def _move_todo_item(lb, delta):
-        sel = lb.curselection()
-        if not sel:
+    def undo(self):
+        """撤销上一次破坏性操作：恢复到最近一次快照并落盘。"""
+        if not self._undo_stack:
+            self._status_msg("没有可撤销的操作。")
             return
-        i = sel[0]
-        j = i + delta
-        if not (0 <= j < lb.size()):
-            return
-        s = lb.get(i)
-        lb.delete(i)
-        lb.insert(j, s)
-        lb.selection_clear(0, "end")
-        lb.selection_set(j)
-        lb.see(j)
+        self.collect_and_save()   # 先落盘当前状态，再恢复快照，任何改动都不会丢
+        self.data = self._undo_stack.pop()
+        storage.save_data(self.data)
+        week = self.data["weeks"].get(self.week_key)
+        wd = week.get("workdays", []) if week else []
+        if not wd:
+            self.week_key = None
+            self.current_date = None
+        elif self.current_date not in wd:
+            self.current_date = wd[0]
+        self.refresh_all()
+        self._status_msg("已撤销上一次修改（Ctrl+Z）。")
 
     # ---------- 数据读写 ----------
 
@@ -775,395 +716,19 @@ class WorkLogApp:
             else:
                 self._status_msg("本周全部记录完成！可以生成周报了 🎉")
 
-    # ---------- 周设置对话框 ----------
+    # ---------- 对话框（实现见 dialogs.py） ----------
 
     def open_week_setup(self, default_date=None):
-        """周设置对话框。返回 True 表示已设置，False 表示取消。"""
-        if default_date is None:
-            default_date = (storage.parse_date(self.current_date)
-                            if self.current_date else datetime.date.today())
-        f = self._font_family
-        win = tk.Toplevel(self.root)
-        win.title("周设置：工作日安排")
-        win.transient(self.root)
-        win.grab_set()
-        win.resizable(False, False)
-        self._setup_result = False
-
-        frm = ttk.Frame(win, padding=12)
-        frm.pack(fill="both", expand=True)
-
-        row0 = ttk.Frame(frm)
-        row0.pack(fill="x", pady=4)
-        ttk.Label(row0, text="汇报人：").pack(side="left")
-        self._setup_var_reporter = tk.StringVar(
-            value=self.data.get("settings", {}).get("reporter", ""))
-        tk.Entry(row0, textvariable=self._setup_var_reporter, width=14, font=(f, 10)).pack(side="left")
-        ttk.Label(row0, text="（可留空；填写后会显示在周报标题下方）").pack(side="left", padx=6)
-
-        row1 = ttk.Frame(frm)
-        row1.pack(fill="x", pady=4)
-        ttk.Label(row1, text="起始日期：").pack(side="left")
-        self._setup_var_date = tk.StringVar(value=storage.format_date(default_date))
-        tk.Entry(row1, textvariable=self._setup_var_date, width=14, font=(f, 10)).pack(side="left")
-        ttk.Label(row1, text="（自动取该日所在周的周一，格式 YYYY-MM-DD）").pack(side="left", padx=6)
-
-        ttk.Label(frm, text="选择工作日：").pack(anchor="w", pady=(10, 2))
-        row2 = ttk.Frame(frm)
-        row2.pack(fill="x")
-        self._setup_vars = []
-        defaults = [True, True, True, True, True, False, False]
-        for i, name in enumerate(storage.WEEKDAY_NAMES):
-            v = tk.BooleanVar(value=defaults[i])
-            v.trace_add("write", lambda *a: self._update_setup_preview())
-            tk.Checkbutton(row2, text=name, variable=v, font=(f, 10)).pack(side="left", padx=4)
-            self._setup_vars.append(v)
-        self._setup_lbl_preview = ttk.Label(frm, text="", foreground="#1f4e79")
-        self._setup_lbl_preview.pack(anchor="w", pady=(8, 0))
-        self._update_setup_preview()
-
-        row3 = ttk.Frame(frm)
-        row3.pack(fill="x", pady=(12, 0))
-        ttk.Button(row3, text="确定", command=lambda: self._confirm_week_setup(win)).pack(
-            side="left", padx=(0, 8))
-        ttk.Button(row3, text="取消", command=win.destroy).pack(side="left")
-
-        self.root.wait_window(win)
-        return self._setup_result
-
-    def _update_setup_preview(self):
-        try:
-            d = storage.parse_date(self._setup_var_date.get())
-            flags = [v.get() for v in self._setup_vars]
-            wd = storage.make_workdays(d, flags)
-            parts = [f"{storage.short_date(w)} {storage.weekday_cn(w)}" for w in wd]
-            self._setup_lbl_preview.config(
-                text="将生成工作日：" + ("、".join(parts) if parts else "（未勾选任何一天）"))
-        except (ValueError, AttributeError, tk.TclError):
-            self._setup_lbl_preview.config(text="日期格式无效")
-
-    def _confirm_week_setup(self, win):
-        try:
-            d = storage.parse_date(self._setup_var_date.get())
-        except ValueError:
-            messagebox.showerror("日期格式错误", "请按 YYYY-MM-DD 格式输入日期，例如 2026-08-19。", parent=win)
-            return
-        flags = [v.get() for v in self._setup_vars]
-        if not any(flags):
-            messagebox.showerror("未选择工作日", "请至少勾选一个工作日。", parent=win)
-            return
-        wd = storage.make_workdays(d, flags)
-        key = storage.format_date(storage.monday_of(d))
-        is_new = key not in self.data["weeks"]
-        week = self.data["weeks"].setdefault(
-            key, {"start_date": key, "workdays": [], "next_week_plan": "", "days": {}})
-        week["workdays"] = wd
-        self.data.setdefault("settings", {})["reporter"] = self._setup_var_reporter.get().strip()
-        carried = self._carry_over_from_prev_week(key) if is_new else 0
-        storage.save_data(self.data)
-        self._setup_result = True
-        win.destroy()
-        if self.week_key != key:
-            self.week_key = key
-            self.current_date = wd[0]
-        elif self.current_date not in wd:
-            self.current_date = wd[0]
-        self.refresh_all()
-        msg = f"已设置 {storage.week_range_label(week)}，共 {len(wd)} 个工作日"
-        if carried:
-            msg += f"；已自动带入上周未完成事项 {carried} 条"
-        self._status_msg(msg)
-
-    # ---------- 历史记录对话框 ----------
+        return dialogs.open_week_setup(self, default_date)
 
     def open_history(self):
-        # 打开前先落盘：窗口里的跳转/删除都会重建界面，未保存的编辑否则会丢失
-        self.collect_and_save()
-        f = self._font_family
-        win = tk.Toplevel(self.root)
-        win.title("历史记录（双击跳转）")
-        win.transient(self.root)
-        win.grab_set()          # 模态：避免开出多个历史窗口各自改数据
-        win.geometry("460x540")
-        lb = tk.Listbox(win, font=(f, 10), activestyle="dotbox")
-        lb.pack(fill="both", expand=True, padx=8, pady=(8, 4))
-        mapping = []  # ("week", key) 或 ("day", key, 日期)
-
-        def fill():
-            lb.delete(0, "end")
-            mapping.clear()
-            for key in sorted(self.data["weeks"], reverse=True):
-                week = self.data["weeks"][key]
-                lb.insert("end", f"▍ {storage.week_range_label(week)}（{len(week.get('workdays', []))} 个工作日）")
-                mapping.append(("week", key))
-                for d in week.get("workdays", []):
-                    day = week.get("days", {}).get(d, {})
-                    n = len(day.get("items", []))
-                    mark = "✓" if day.get("done") else ("·" if n else " ")
-                    lb.insert("end", f"    {storage.short_date(d)} {storage.weekday_cn(d)}   {mark}  {n} 条记录")
-                    mapping.append(("day", key, d))
-
-        def selected():
-            sel = lb.curselection()
-            return mapping[sel[0]] if sel else None
-
-        def go():
-            item = selected()
-            if item and item[0] == "day":
-                self.collect_and_save()   # 跳转前保存当前编辑
-                self.week_key, self.current_date = item[1], item[2]
-                self.refresh_all()
-                win.destroy()
-
-        def delete_day():
-            item = selected()
-            if not item or item[0] != "day":
-                messagebox.showinfo("提示", "请先选中某个日期（有缩进的行）。", parent=win)
-                return
-            _, key, d = item
-            label = f"{storage.short_date(d)} {storage.weekday_cn(d)}"
-            if not messagebox.askyesno("确认删除",
-                                       f"确认删除 {label} 的全部记录吗？\n此操作不可恢复。",
-                                       parent=win):
-                return
-            self.collect_and_save()
-            storage.snapshot("del_day")   # 删除前留快照，可从 data/backup/ 取回
-            self.data["weeks"][key]["days"].pop(d, None)
-            storage.save_data(self.data)
-            if self.week_key == key:
-                self.refresh_all()
-            fill()
-            self._status_msg(f"已删除 {label} 的记录（如需恢复见 data/backup/）")
-
-        def delete_week():
-            item = selected()
-            if not item or item[0] != "week":
-                messagebox.showinfo("提示", "请先选中要删除的整周（▍开头的一行）。", parent=win)
-                return
-            key = item[1]
-            week = self.data["weeks"][key]
-            label = storage.week_range_label(week)
-            if not messagebox.askyesno("确认删除",
-                                       f"确认删除整周 {label} 的记录和工作日设置吗？\n此操作不可恢复。",
-                                       parent=win):
-                return
-            self.collect_and_save()
-            storage.snapshot("del_week")  # 删除前留快照，可从 data/backup/ 取回
-            self.data["weeks"].pop(key, None)
-            storage.save_data(self.data)
-            if self.week_key == key:
-                self.week_key = None
-                self.current_date = None
-                self.refresh_all()
-            fill()
-            self._status_msg(f"已删除整周 {label}（如需恢复见 data/backup/）")
-
-        fill()
-        btns = ttk.Frame(win, padding=(8, 0, 8, 8))
-        btns.pack(fill="x")
-        ttk.Button(btns, text="跳转到该日", command=go).pack(side="left")
-        ttk.Button(btns, text="删除该日记录", command=delete_day).pack(side="left", padx=(8, 0))
-        ttk.Button(btns, text="删除整周", command=delete_week).pack(side="left", padx=(8, 0))
-        lb.bind("<Double-Button-1>", lambda e: go())
-
-    # ---------- 搜索 ----------
+        dialogs.open_history(self)
 
     def open_search(self):
-        """搜索对话框：对历史与当前全部记录做模糊搜索，双击/回车跳转到对应日期。"""
-        self.collect_and_save()
-        f = self._font_family
-        win = tk.Toplevel(self.root)
-        win.title("搜索记录（历史 + 当前）")
-        win.transient(self.root)
-        win.grab_set()
-        win.geometry("720x560")
-        win.minsize(560, 420)
+        dialogs.open_search(self)
 
-        top = ttk.Frame(win, padding=(10, 8, 10, 0))
-        top.pack(fill="x")
-        ttk.Label(top, text="关键词：").pack(side="left")
-        var_q = tk.StringVar()
-        entry = tk.Entry(top, textvariable=var_q, font=(f, 10))
-        entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        lbl_count = ttk.Label(top, text="", foreground="#595959")
-        lbl_count.pack(side="right")
-
-        ttk.Label(win,
-                  text="模糊匹配工作内容 / 难点备注 / 状态 / 下周计划；"
-                       "空格分隔多个关键词（须全部命中）。",
-                  foreground="#9e9e9e", padding=(10, 2, 10, 2)).pack(fill="x")
-
-        body = ttk.Frame(win, padding=(10, 4))
-        body.pack(fill="both", expand=True)
-        txt = tk.Text(body, font=(f, 10), wrap="word", state="disabled",
-                      background="#ffffff", cursor="arrow")
-        scroll = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
-        txt.configure(yscrollcommand=scroll.set)
-        txt.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-        txt.tag_configure("hit", background="#ffe58f")     # 命中的关键词
-        txt.tag_configure("week", font=(f, 9, "bold"), foreground="#3F51B1")
-        txt.tag_configure("day", font=(f, 9, "bold"), foreground="#595959")
-        txt.tag_configure("plan", foreground="#1f4e79")
-        txt.tag_configure("sel", background="#cce5ff")     # 选中的行
-        st_tags = {}
-        for i, st in enumerate(report.STATUS_TEXT_COLORS):
-            tag = f"st{i}"
-            txt.tag_configure(tag, foreground=report.STATUS_TEXT_COLORS[st],
-                              font=(f, 10, "bold"))
-            st_tags[st] = tag
-
-        closed = [False]
-        line_no = 0
-        mapping = []   # (行号, week_key, 日期或 None, kind)
-        selected = {"line": None}
-
-        def next_line():
-            nonlocal line_no
-            line_no += 1
-            return line_no
-
-        def render():
-            nonlocal line_no
-            q = var_q.get().strip()
-            kws = [k for k in q.casefold().split() if k]
-            txt.config(state="normal")
-            txt.delete("1.0", "end")
-            mapping.clear()
-            line_no = 0
-            selected["line"] = None
-            txt.tag_remove("sel", "1.0", "end")
-
-            def add_hits(ln, line_text):
-                low = line_text.casefold()
-                for kw in kws:
-                    pos = low.find(kw)
-                    while pos != -1:
-                        txt.tag_add("hit", f"{ln}.{pos}", f"{ln}.{pos + len(kw)}")
-                        pos = low.find(kw, pos + len(kw))
-
-            results = report.search_items(self.data, q)
-            if not q:
-                txt.insert("end", "输入关键词开始搜索。\n")
-                lbl_count.config(text="")
-                txt.config(state="disabled")
-                return
-            if not results:
-                txt.insert("end", f"没有找到与「{q}」相关的记录。\n")
-                lbl_count.config(text="0 条")
-                txt.config(state="disabled")
-                return
-            n_item = sum(1 for r in results if r["kind"] == "item")
-            n_plan = len(results) - n_item
-            lbl_count.config(text=f"{n_item} 条记录" + (f"，{n_plan} 条计划" if n_plan else ""))
-            last_week = None
-            last_day = None
-            for r in results:
-                if r["week_key"] != last_week:
-                    last_week, last_day = r["week_key"], None
-                    ln = next_line()
-                    suffix = "（当前周）" if r["week_key"] == self.week_key else ""
-                    txt.insert("end", f"▍ {r['week_label']}{suffix}\n", "week")
-                    mapping.append((ln, r["week_key"], None, "week"))
-                if r["kind"] == "plan":
-                    ln = next_line()
-                    line_text = f"    四、下周计划：{report._flat(r['plan'])}"
-                    txt.insert("end", line_text + "\n", "plan")
-                    add_hits(ln, line_text)
-                    mapping.append((ln, r["week_key"], None, "plan"))
-                    continue
-                if r["date"] != last_day:
-                    last_day = r["date"]
-                    ln = next_line()
-                    txt.insert("end", f"  {storage.short_date(r['date'])} "
-                                     f"{storage.weekday_cn(r['date'])}\n", "day")
-                    mapping.append((ln, r["week_key"], r["date"], "day"))
-                content = (r["item"].get("content") or "").strip() or "（未填写内容）"
-                status = r["item"].get("status") or "未开始"
-                diff = (r["item"].get("difficulty") or "").strip()
-                prefix = f"    {r['seq']}. {report._flat(content)} —— "
-                line_text = prefix + status + (f"【难点：{report._flat(diff)}】" if diff else "")
-                ln = next_line()
-                txt.insert("end", prefix)
-                txt.insert("end", status, st_tags[status])
-                if diff:
-                    txt.insert("end", f"【难点：{report._flat(diff)}】")
-                txt.insert("end", "\n")
-                add_hits(ln, line_text)
-                mapping.append((ln, r["week_key"], r["date"], "item"))
-            txt.config(state="disabled")
-            # 默认选中第一条记录，回车即可跳转
-            first = next((m for m in mapping if m[3] == "item"),
-                         next((m for m in mapping if m[3] == "plan"), mapping[0]))
-            selected["line"] = first[0]
-            txt.tag_add("sel", f"{first[0]}.0", f"{first[0]}.0 lineend")
-
-        def find_target(ln):
-            tgt = None
-            for m in mapping:
-                if m[0] > ln:
-                    break
-                tgt = m
-            return tgt
-
-        def goto_line(ln):
-            tgt = find_target(ln)
-            if not tgt:
-                return
-            _, wk, dt, _kind = tgt
-            week = self.data["weeks"].get(wk)
-            wd = week.get("workdays", []) if week else []
-            if not wd:
-                self._status_msg("该周没有设置工作日，无法跳转。")
-                return
-            self.week_key = wk
-            if dt and dt in wd:
-                self.current_date = dt
-            elif self.current_date not in wd:
-                self.current_date = wd[0]
-            self.refresh_all()
-            self._status_msg(f"已跳转到 {storage.short_date(self.current_date)} "
-                             f"{storage.weekday_cn(self.current_date)}（搜索结果）")
-            close()
-
-        def jump_selected():
-            if selected["line"] is not None:
-                goto_line(selected["line"])
-
-        def on_click(event):
-            ln = int(txt.index(f"@{event.x},{event.y}").split(".")[0])
-            if not txt.get(f"{ln}.0", f"{ln}.0 lineend").strip():
-                return    # 空白行不可选
-            txt.tag_remove("sel", "1.0", "end")
-            txt.tag_add("sel", f"{ln}.0", f"{ln}.0 lineend")
-            selected["line"] = ln
-
-        def on_dbl(event):
-            ln = int(txt.index(f"@{event.x},{event.y}").split(".")[0])
-            if not txt.get(f"{ln}.0", f"{ln}.0 lineend").strip():
-                return
-            goto_line(ln)
-
-        def close():
-            if not closed[0]:
-                closed[0] = True
-                win.destroy()
-
-        win.protocol("WM_DELETE_WINDOW", close)
-        win.bind("<Escape>", lambda e: close())
-        win.bind("<Return>", lambda e: jump_selected())   # 对话框内任意位置回车均可跳转
-        win.bind("<Map>", lambda e: entry.focus_force())  # 窗口显示后强制焦点到输入框，打开即可输入
-        txt.bind("<Button-1>", on_click)
-        txt.bind("<Double-Button-1>", on_dbl)
-        var_q.trace_add("write", lambda *a: None if closed[0] else render())
-
-        btns = ttk.Frame(win, padding=(10, 0, 10, 8))
-        btns.pack(fill="x")
-        ttk.Button(btns, text="跳转到选中记录（回车）", command=jump_selected).pack(side="left")
-        ttk.Button(btns, text="关闭", command=close).pack(side="left", padx=(8, 0))
-
-        render()
-        entry.focus_set()
+    def open_todo_list(self):
+        dialogs.open_todo_list(self)
 
     # ---------- 周报 ----------
 
@@ -1181,130 +746,61 @@ class WorkLogApp:
                     f"本周还有 {len(wd) - filled} 天未标记完成，仍要生成周报吗？",
                     parent=self.root):
                 return
-        ReportDialog(self.root, self, self.data, week)
+        dialogs.ReportDialog(self.root, self, self.data, week)
 
 
-class ReportDialog:
-    """周报预览与导出对话框。"""
+_SINGLE_INSTANCE_HANDLE = None   # 互斥体句柄，进程存活期间保持持有
 
-    def __init__(self, parent, app, data, week):
-        self.app = app
-        self.data = data
-        self.week = week
-        f = app._font_family
 
-        self.win = tk.Toplevel(parent)
-        self.win.title("周报预览与导出")
-        self.win.transient(parent)
-        self.win.grab_set()
-        self.win.geometry("780x680")
-        self.win.minsize(640, 520)
+def _acquire_single_instance_lock():
+    """同一数据目录只允许一个实例运行，防止两个进程互相覆盖写入（Windows 互斥体）。
 
-        top = ttk.Frame(self.win, padding=(10, 8, 10, 0))
-        top.pack(fill="x")
-        ttk.Label(top, text=report.report_title(week), font=(f, 12, "bold")).pack(anchor="w")
-        ttk.Label(top, text=report.overview_sentence(week, data), foreground="#595959").pack(
-            anchor="w", pady=(2, 0))
+    返回：句柄（需全程持有）/ "exists"（已有实例在运行）/ None（非 Windows 或失败，不拦截）。
+    """
+    global _SINGLE_INSTANCE_HANDLE
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        import hashlib
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.GetLastError.restype = wintypes.DWORD
+        token = hashlib.md5(storage.DATA_FILE.encode("utf-8")).hexdigest()[:12]
+        handle = kernel32.CreateMutexW(None, False, "Local\\WorkLog_" + token)
+        if not handle:
+            return None
+        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            return "exists"
+        _SINGLE_INSTANCE_HANDLE = handle
+        return handle
+    except Exception:
+        return None
 
-        body = ttk.Frame(self.win, padding=(10, 6))
-        body.pack(fill="both", expand=True)
-        ttk.Label(body, text="纯文本预览（可直接修改，改完点「💾 保存修改」回写到记录，HTML 版同步生效）：").pack(anchor="w")
-        self.txt = tk.Text(body, font=(f, 10), wrap="word", undo=True)
-        self.txt.pack(fill="both", expand=True, pady=(2, 6))
-        draft = week.get("report_draft")
-        self.txt.insert("1.0", draft if draft else report.build_plain(data, week))
 
-        btns = ttk.Frame(self.win, padding=(10, 0, 10, 4))
-        btns.pack(fill="x")
-        ttk.Button(btns, text="💾 保存修改", command=self._save_and_apply).pack(side="left")
-        ttk.Button(btns, text="📋 复制 HTML（粘贴到 Outlook）", command=self._copy_html).pack(side="left", padx=(8, 0))
-        ttk.Button(btns, text="导出 HTML 文件", command=self._export_html).pack(side="left", padx=(8, 0))
-        ttk.Button(btns, text="浏览器预览", command=self._preview_browser).pack(side="left", padx=(8, 0))
-        ttk.Button(btns, text="导出纯文本", command=self._export_txt).pack(side="left", padx=(8, 0))
-        ttk.Button(btns, text="用 Outlook 打开邮件", command=self._open_outlook).pack(side="left", padx=(8, 0))
+def _show_already_running():
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            None, "工作日志已经在运行中（同一数据目录只能打开一个窗口）。\n"
+                  "如需重新打开，请先关闭已打开的窗口。",
+            "工作日志", 0x40)   # MB_ICONINFORMATION
+    except Exception:
+        print("工作日志已经在运行中。")
 
-        self.lbl_status = ttk.Label(
-            self.win,
-            text="HTML 版为带样式表格，粘贴到 Outlook 正文不变形；纯文本版可在上方预览中修改。",
-            foreground="#595959", padding=(10, 0, 10, 8))
-        self.lbl_status.pack(fill="x")
 
-    def _msg(self, text):
-        self.lbl_status.config(text=text)
-
-    def _save_and_apply(self):
-        """把预览里的修改解析回写记录并落盘；解析不出明细时保存为草稿（下次打开恢复）。
-
-        回写是覆盖式的，所以先做影响评估并让用户确认：
-        某天一条都没解析出来（多半是格式被改坏了）会跳过该天、保留原记录。
-        """
-        text = self.txt.get("1.0", "end-1c")
-        info = report.plain_back_summary(self.week, text, self.data)
-        if info["items"]:
-            tips = [f"将回写 {info['days']} 天共 {info['items']} 条记录（覆盖这些天的原有条目）。"]
-            if info["skipped"]:
-                tips.append("以下日期未能从文本解析出条目，将保留原记录不做修改：\n  "
-                            + "、".join(storage.short_date(d) for d in info["skipped"])
-                            + "\n（通常是「1. 内容 —— 状态」这一行的格式被改动了）")
-            tips.append("原数据已自动备份到 data/backup/。确认继续？")
-            if not messagebox.askyesno("确认回写", "\n\n".join(tips), parent=self.win):
-                self._msg("已取消回写，记录未改动。")
-                return
-            storage.snapshot("report_writeback")
-        n = report.apply_plain_back(self.week, text, self.data)
-        if n:
-            self.week.pop("report_draft", None)  # 修改已进数据，草稿不再需要
-            storage.save_data(self.data)
-            self.app.collect_and_save()
-            self.app.refresh_all()
-            msg = f"✅ 已保存修改并回写 {n} 条记录，HTML 版与纯文本版同步生效。"
-            if info["skipped"]:
-                msg += f"（{len(info['skipped'])} 天格式无法解析，已保留原记录）"
-            self._msg(msg)
-        else:
-            self.week["report_draft"] = text
-            storage.save_data(self.data)
-            self._msg("✅ 已保存为草稿（未能从文本解析出明细，复制 HTML 仍按原数据生成；"
-                      "导出纯文本 / Outlook 邮件会使用当前修改后的内容。）")
-
-    def _copy_html(self):
-        ok, err = report.copy_html_to_clipboard(report.build_html(self.data, self.week))
-        if ok:
-            self._msg("✅ 已复制到剪贴板，到 Outlook 邮件正文按 Ctrl+V 即可（表格样式保持不变）。")
-        else:
-            messagebox.showerror("复制失败", err, parent=self.win)
-
-    def _export_html(self):
-        path = report.export_file(self.data, self.week, "html")
-        self._msg(f"✅ 已导出：{path}")
-
-    def _preview_browser(self):
+def _install_excepthook():
+    def hook(exc_type, exc, tb):
+        logging.getLogger("worklog").error(
+            "未捕获异常", exc_info=(exc_type, exc, tb))
         try:
-            path = report.export_file(self.data, self.week, "html")
-            # 用 webbrowser 而非 os.startfile：后者只存在于 Windows，其他平台会 AttributeError
-            webbrowser.open("file:///" + os.path.abspath(path).replace(os.sep, "/"))
-            self._msg(f"✅ 已在浏览器打开：{path}")
-        except (OSError, webbrowser.Error) as e:
-            messagebox.showerror("打开失败", str(e), parent=self.win)
-
-    def _export_txt(self):
-        path = report.export_file(self.data, self.week, "txt",
-                                  custom_text=self.txt.get("1.0", "end-1c"))
-        self._msg(f"✅ 已导出：{path}")
-
-    def _open_outlook(self):
-        ok, err = report.outlook_available()
-        if not ok:
-            messagebox.showerror("无法调用 Outlook", err, parent=self.win)
-            return
-        subject = report.report_title(self.week)
-        try:
-            report.open_in_outlook(subject,
-                                   report.build_html(self.data, self.week, full_document=True),
-                                   self.txt.get("1.0", "end-1c"))
-            self._msg("✅ 已在 Outlook 中打开周报邮件，可编辑后发送。")
-        except Exception as e:
-            messagebox.showerror("调用 Outlook 失败", str(e), parent=self.win)
+            messagebox.showerror(
+                "程序出错", f"发生未预期错误：{exc}\n错误详情已写入 data/worklog.log。")
+        except Exception:
+            pass
+    sys.excepthook = hook
 
 
 def main():
@@ -1312,8 +808,14 @@ def main():
         # 打包后的 exe 自检：工作日志.exe --smoke
         run_smoke(os.path.join(os.environ.get("TEMP", "."), "worklog_smoke_exe"))
         return
+    storage.setup_logging()
+    logging.getLogger("worklog").info("启动工作日志（数据文件：%s）", storage.DATA_FILE)
+    if _acquire_single_instance_lock() == "exists":
+        _show_already_running()
+        return
     _enable_dpi_awareness()
     root = tk.Tk()
+    _install_excepthook()
     WorkLogApp(root)
     root.mainloop()
 

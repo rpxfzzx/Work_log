@@ -8,6 +8,7 @@
 import datetime
 import glob
 import json
+import logging
 import os
 import shutil
 import sys
@@ -23,6 +24,7 @@ BACKUP_DIR = os.path.join(DATA_DIR, "backup")
 
 DATA_VERSION = 1        # 数据结构版本，便于以后迁移
 BACKUP_KEEP = 10        # 备份保留份数（超出按时间删最旧的）
+BAD_KEEP = 3            # 损坏数据文件（.bad）保留份数
 
 WEEKDAY_NAMES = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
 STATUSES = ["未开始", "进行中", "已完成"]
@@ -92,6 +94,8 @@ def _clean_week(key, week):
            "days": days}
     if isinstance(week.get("report_draft"), str):
         out["report_draft"] = week["report_draft"]
+    if isinstance(week.get("report_draft_fp"), str):
+        out["report_draft_fp"] = week["report_draft_fp"]
     return out
 
 
@@ -117,19 +121,39 @@ def normalize_data(data):
 # ---------- 读写 ----------
 
 def load_data():
-    """读取数据文件；不存在返回空结构，损坏则备份为 .bad 后重建，结构异常自动修复。"""
+    """读取数据文件；不存在返回空结构，损坏则备份为带时间戳的 .bad 后重建，结构异常自动修复。"""
     if not os.path.exists(DATA_FILE):
         return _empty_data()
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (ValueError, OSError):
+        # 时间戳分辨率可能不足（Windows 约 15ms），同名时追加序号保证不覆盖旧备份
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        bad_path = DATA_FILE + f".{stamp}.bad"
+        i = 1
+        while os.path.exists(bad_path):
+            bad_path = DATA_FILE + f".{stamp}_{i}.bad"
+            i += 1
         try:
-            os.replace(DATA_FILE, DATA_FILE + ".bad")
+            os.replace(DATA_FILE, bad_path)
         except OSError:
             pass
+        _prune_bad_files()
+        logging.getLogger("worklog").warning(
+            "数据文件损坏，已备份为 %s 并重建空数据", bad_path)
         return _empty_data()
     return normalize_data(data)
+
+
+def _prune_bad_files():
+    """损坏备份（.bad）只保留最近 BAD_KEEP 份，避免反复损坏时堆积。"""
+    files = sorted(glob.glob(DATA_FILE + ".*.bad"))
+    for p in files[:-BAD_KEEP]:
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
 
 
 def _prune_backups():
@@ -150,12 +174,17 @@ def snapshot(tag="auto"):
         return None
     try:
         os.makedirs(BACKUP_DIR, exist_ok=True)
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = os.path.join(BACKUP_DIR, f"worklog_{stamp}_{tag}.json")
+        i = 1
+        while os.path.exists(path):   # 同一秒内多次快照不互相覆盖
+            path = os.path.join(BACKUP_DIR, f"worklog_{stamp}_{tag}_{i}.json")
+            i += 1
         shutil.copy2(DATA_FILE, path)
         _prune_backups()
         return path
     except OSError:
+        logging.getLogger("worklog").warning("快照备份失败（%s）", tag, exc_info=True)
         return None
 
 
@@ -175,13 +204,27 @@ def _daily_backup():
         pass
 
 
+def cleanup_stale_tmp(base_file):
+    """删除历史进程残留的 .tmp 文件（写入用进程号命名，崩溃后会留下）。"""
+    for p in glob.glob(base_file + ".*.tmp"):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
 def save_data(data, backup=True):
-    """原子写入：先写临时文件、flush+fsync 落盘，再替换，防止写入中断或断电损坏数据。"""
+    """原子写入：先写临时文件、flush+fsync 落盘，再替换，防止写入中断或断电损坏数据。
+
+    临时文件名带进程号，避免两个进程（未走单实例锁时）互相覆盖对方的写入；
+    写之前清理历史进程残留的 .tmp。
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
     if backup:
         _daily_backup()
     data.setdefault("version", DATA_VERSION)
-    tmp = DATA_FILE + ".tmp"
+    cleanup_stale_tmp(DATA_FILE)
+    tmp = f"{DATA_FILE}.{os.getpid()}.tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.flush()
@@ -273,3 +316,27 @@ def week_range_label(week):
         return f"{short_date(wd[0])} ~ {short_date(wd[-1])}"
     monday = monday_of(parse_date(week.get("start_date", format_date(datetime.date.today()))))
     return f"{short_date(monday)} ~ {short_date(monday + datetime.timedelta(days=6))}"
+
+
+# ---------- 日志 ----------
+
+def setup_logging():
+    """把运行日志写到 data/worklog.log（轮转 2 份 × 512KB），失败静默。
+
+    模块里各函数用 logging.getLogger("worklog") 记关键失败路径，
+    便于用户出问题时把日志发回来排查。
+    """
+    logger = logging.getLogger("worklog")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            os.path.join(DATA_DIR, "worklog.log"),
+            maxBytes=512 * 1024, backupCount=2, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(handler)
+    except OSError:
+        pass
+    return logger

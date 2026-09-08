@@ -315,6 +315,46 @@ def test_回写不会给未在文本中出现的日期建空结构():
     assert "2026-08-18" not in w["days"]
 
 
+def test_回写_内容含破折号不截断():
+    """内容里带「——」（无空格）时，分隔符应取最后一个，内容不被截断。"""
+    w = make_week({"2026-08-17": [item("修复 A——B 的缺陷", "进行中")]})
+    report.apply_plain_back(w, report.build_plain(DATA, w))
+    assert w["days"]["2026-08-17"]["items"][0]["content"] == "修复 A——B 的缺陷"
+
+
+def test_回写_内容含带空格破折号取最后一个分隔():
+    w = make_week({"2026-08-17": [item("方案 A —— B 评审", "已完成")]})
+    report.apply_plain_back(w, report.build_plain(DATA, w))
+    assert w["days"]["2026-08-17"]["items"][0]["content"] == "方案 A —— B 评审"
+
+
+def test_多行难点按内容匹配还原_与行序无关():
+    """在文本里调换条目行顺序后，多行难点应跟随内容还原，而不是按位置错位。"""
+    w = make_week({"2026-08-17": [item("甲", "进行中", "难点一\n第二行"),
+                                  item("乙", "进行中", "难点二\n第三行")]})
+    text = report.build_plain(DATA, w)
+    lines = text.split("\n")
+    i1 = next(i for i, ln in enumerate(lines) if ln.startswith("1. 甲"))
+    i2 = next(i for i, ln in enumerate(lines) if ln.startswith("2. 乙"))
+    lines[i1], lines[i2] = lines[i2], lines[i1]
+    report.apply_plain_back(w, "\n".join(lines))
+    by = {it["content"]: it["difficulty"] for it in w["days"]["2026-08-17"]["items"]}
+    assert by["甲"] == "难点一\n第二行"
+    assert by["乙"] == "难点二\n第三行"
+
+
+def test_周数据指纹_记录变化后指纹不同():
+    w = make_week({"2026-08-17": [item("A", "进行中")]})
+    fp1 = report.week_fingerprint(DATA, w)
+    assert fp1 == report.week_fingerprint(DATA, w)
+    w["days"]["2026-08-17"]["items"][0]["status"] = "已完成"
+    assert fp1 != report.week_fingerprint(DATA, w)
+    w["days"]["2026-08-17"]["items"][0]["status"] = "进行中"
+    assert fp1 == report.week_fingerprint(DATA, w)
+    w["days"]["2026-08-17"]["items"][0]["difficulty"] = "新难点"
+    assert fp1 != report.week_fingerprint(DATA, w)
+
+
 # ---------- 输出格式 ----------
 
 def test_html_全内联样式且转义():
