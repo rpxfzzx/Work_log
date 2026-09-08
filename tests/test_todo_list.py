@@ -46,3 +46,14 @@ def test_结构异常读取时自动修复(tmp_path, monkeypatch):
     (tmp_path / "todo_list.json").write_text(
         json.dumps({"items": ["A", 123, None, " B "]}, ensure_ascii=False), encoding="utf-8")
     assert todo_list.load_items() == ["A", "123", "B"]
+
+
+def test_ensure_file_启动时自动创建目录与空清单(tmp_path, monkeypatch):
+    _redirect(tmp_path, monkeypatch)
+    todo_list.ensure_file()
+    assert (tmp_path / "todo_list.json").exists()
+    assert todo_list.load_items() == []
+    # 已存在时不覆盖已有内容
+    todo_list.save_items(["A"])
+    todo_list.ensure_file()
+    assert todo_list.load_items() == ["A"]

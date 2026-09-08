@@ -53,6 +53,7 @@ class WorkLogApp:
     def __init__(self, root, auto_setup=False):
         self.root = root
         self.data = storage.load_data()
+        todo_list.ensure_file()   # 保证常用工作清单目录与文件存在
         self.week_key = None       # 当前查看的周 key（周一日期字符串）
         self.current_date = None   # 当前查看的日期字符串
         self.row_widgets = []      # 条目行控件列表
@@ -193,7 +194,6 @@ class WorkLogApp:
         right_grp.grid(row=0, column=2, sticky="e")
         ttk.Button(left_grp, text="＋ 添加一行", command=self.add_row).pack(side="left")
         ttk.Button(left_grp, text="删除选中行", command=self.delete_selected_row).pack(side="left", padx=(8, 0))
-        ttk.Button(left_grp, text="⧉ 复制昨日", command=self.copy_prev_day).pack(side="left", padx=(8, 0))
         ttk.Button(center_grp, text="◀ 前一天", command=lambda: self.nav(-1)).pack(side="left")
         ttk.Button(center_grp, text="💾 保存当天", command=lambda: self.save_now(notify=True)).pack(
             side="left", padx=(8, 0))
@@ -569,7 +569,8 @@ class WorkLogApp:
         win.transient(self.root)
         win.grab_set()
         win.geometry("470x430")
-        win.resizable(False, False)
+        win.minsize(430, 380)
+        win.resizable(True, True)
 
         frm = ttk.Frame(win, padding=10)
         frm.pack(fill="both", expand=True)
@@ -626,14 +627,22 @@ class WorkLogApp:
 
         row_ok = ttk.Frame(frm)
         row_ok.pack(fill="x")
+        self._todo_saved_lbl = ttk.Label(row_ok, text="", foreground="#375623")
 
         def do_save():
+            todo_list.save_items([lb.get(i) for i in range(lb.size())])
+            self._todo_saved_lbl.config(text=f"已保存 {lb.size()} 条")
+
+        def do_save_and_close():
             todo_list.save_items([lb.get(i) for i in range(lb.size())])
             win.destroy()
             self._status_msg(f"常用工作清单已保存（{lb.size()} 条）")
 
-        ttk.Button(row_ok, text="保存并关闭", command=do_save).pack(side="left")
-        ttk.Button(row_ok, text="取消", command=win.destroy).pack(side="left", padx=8)
+        ttk.Button(row_ok, text="保存", command=do_save).pack(side="left")
+        ttk.Button(row_ok, text="保存并关闭", command=do_save_and_close).pack(side="left", padx=6)
+        ttk.Button(row_ok, text="取消", command=win.destroy).pack(side="left", padx=(16, 8))
+        self._todo_saved_lbl.pack(side="left")
+        win.protocol("WM_DELETE_WINDOW", do_save_and_close)   # 点右上角 ✕ 也保存
         win.bind("<Return>", lambda e: do_add())
         ent.focus_set()
 

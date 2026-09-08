@@ -57,3 +57,9 @@ def save_items(items):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, TODO_FILE)
+
+
+def ensure_file():
+    """应用启动时调用：清单目录与文件不存在则创建（空清单），保证用户能看到配置位置。"""
+    if not os.path.exists(TODO_FILE):
+        save_items([])
