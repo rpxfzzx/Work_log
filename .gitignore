@@ -18,3 +18,7 @@ reports/
 
 # 本地工具配置（机器专属，不入库）
 .claude/
+.idea/
+
+# 常用工作清单（个人配置，不入库）
+todo_list-config/

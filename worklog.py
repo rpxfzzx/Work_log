@@ -14,6 +14,7 @@ from tkinter import messagebox, ttk
 
 import report
 import storage
+import todo_list
 
 
 def _enable_dpi_awareness():
@@ -108,6 +109,7 @@ class WorkLogApp:
         self.lbl_header = ttk.Label(top, text="", font=(f, 10, "bold"))
         self.lbl_header.pack(side="left")
         ttk.Button(top, text="周设置", command=self.open_week_setup).pack(side="right", padx=(8, 0))
+        ttk.Button(top, text="📌 常用工作", command=self.open_todo_list).pack(side="right", padx=(8, 0))
         ttk.Button(top, text="📅 历史记录", command=self.open_history).pack(side="right")
         ttk.Button(top, text="🔍 搜索", command=self.open_search).pack(side="right", padx=(8, 0))
 
@@ -407,11 +409,19 @@ class WorkLogApp:
                          font=(f, 9, "bold"))
         badge.pack(fill="both", expand=True)
 
-        txt_c = tk.Text(frm, font=(f, 10), height=1, width=1, wrap="word", undo=False,
+        cell_c = tk.Frame(frm, bg="#ffffff")
+        cell_c.grid(row=0, column=1, sticky="ew", padx=2, pady=3)
+        txt_c = tk.Text(cell_c, font=(f, 10), height=1, width=1, wrap="word", undo=False,
                         borderwidth=1, relief="solid", highlightthickness=1,
                         highlightbackground="#d9d9d9", highlightcolor="#9e9e9e")
-        txt_c.grid(row=0, column=1, sticky="ew", padx=2, pady=3)
+        txt_c.pack(side="left", fill="both", expand=True)
         txt_c.insert("1.0", content)
+
+        # 常用工作下拉：▾ 按钮（右键内容框同效），选择后填入工作内容；手动填写保留
+        dd_btn = tk.Button(cell_c, text="▾", font=(f, 7), width=2, relief="groove", bd=1,
+                           bg="#eef1f6", activebackground="#d9e6f5", cursor="hand2",
+                           command=lambda: self._show_todo_menu(dd_btn, txt_c))
+        dd_btn.pack(side="right", fill="y")
 
         status_box = tk.Frame(frm, width=WorkLogApp.COL_STATUS, bg="#ffffff")
         status_box.grid(row=0, column=2, sticky="ns", pady=3)
@@ -435,12 +445,13 @@ class WorkLogApp:
         btn_del.pack(anchor="center")
 
         rw = {"frame": frm, "badge": badge, "content": txt_c, "status": var_s,
-              "combo": combo, "diff": txt_d, "btn": btn_del,
-              "boxes": (badge_box, status_box, del_box)}
+              "combo": combo, "diff": txt_d, "btn": btn_del, "dd": dd_btn,
+              "boxes": (badge_box, cell_c, status_box, del_box)}
         btn_del.config(command=lambda rw=rw: self.delete_row_by_ref(rw))
         var_s.trace_add("write", lambda *a, rw=rw: self._on_status_change(rw))
-        for w in (frm, badge_box, txt_c, status_box, txt_d, del_box):
+        for w in (frm, badge_box, txt_c, cell_c, status_box, txt_d, del_box):
             w.bind("<Button-1>", lambda e, rw=rw: self._select_row(rw), add="+")
+        txt_c.bind("<Button-3>", lambda e, rw=rw: self._show_todo_menu(rw["dd"], rw["content"]))
         for w in (txt_c, txt_d):
             # 注意：lambda 必须用默认参数捕获 w，否则循环结束后 w 恒为 txt_d，
             # 会导致工作内容框的事件实际调整难点备注框的高度
@@ -520,6 +531,127 @@ class WorkLogApp:
         self.root.after_idle(self._reautosize_rows)
         self._status_msg(f"已从 {storage.short_date(prev[1])} 复制 {added} 条未完成条目"
                          + ("（其余为重复项已跳过）" if added < len(items) else ""))
+
+    # ---------- 常用工作清单（下拉录入） ----------
+
+    def _show_todo_menu(self, widget, txt_c):
+        """弹出常用工作下拉菜单；选中后填入工作内容框（为空则直接填入，非空则另起一行追加）。"""
+        menu = tk.Menu(widget, tearoff=0, font=(self._font_family, 10))
+        items = todo_list.load_items()
+        if items:
+            for it in items:
+                menu.add_command(label=it, command=lambda it=it: self._insert_todo_item(txt_c, it))
+        else:
+            menu.add_command(label="（暂无常用工作）", state="disabled")
+        menu.add_separator()
+        menu.add_command(label="管理常用工作…", command=self.open_todo_list)
+        try:
+            x = widget.winfo_rootx()
+            y = widget.winfo_rooty() + widget.winfo_height()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _insert_todo_item(self, txt_c, item):
+        """把选中的常用工作填入工作内容框，自动重算高度并保存。"""
+        cur = txt_c.get("1.0", "end-1c").strip()
+        if report.norm_content(cur) == report.norm_content(item):
+            return
+        txt_c.insert("1.0", item) if not cur else txt_c.insert("end-1c", "\n" + item)
+        self._autosize_text(txt_c)
+        self.collect_and_save()
+
+    def open_todo_list(self):
+        """常用工作清单管理对话框：添加 / 删除 / 排序，保存到 todo_list-config 目录。"""
+        f = self._font_family
+        win = tk.Toplevel(self.root)
+        win.title("常用工作清单")
+        win.transient(self.root)
+        win.grab_set()
+        win.geometry("470x430")
+        win.resizable(False, False)
+
+        frm = ttk.Frame(win, padding=10)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="常用工作（录入时点工作内容右侧 ▾ 或右键内容框选择）：").pack(anchor="w")
+
+        box = ttk.Frame(frm)
+        box.pack(fill="both", expand=True, pady=6)
+        lb = tk.Listbox(box, font=(f, 10), activestyle="dotbox")
+        lb.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(box, command=lb.yview)
+        scroll.pack(side="right", fill="y")
+        lb.config(yscrollcommand=scroll.set)
+        for it in todo_list.load_items():
+            lb.insert("end", it)
+
+        row_add = ttk.Frame(frm)
+        row_add.pack(fill="x", pady=(0, 6))
+        var_new = tk.StringVar()
+        ent = tk.Entry(row_add, textvariable=var_new, font=(f, 10))
+        ent.pack(side="left", fill="x", expand=True)
+
+        def do_add():
+            s = var_new.get().strip()
+            if not s:
+                return
+            for i in range(lb.size()):
+                if lb.get(i) == s:
+                    lb.selection_clear(0, "end")
+                    lb.selection_set(i)
+                    lb.see(i)
+                    var_new.set("")
+                    return
+            lb.insert("end", s)
+            lb.see("end")
+            var_new.set("")
+
+        ttk.Button(row_add, text="添加", command=do_add).pack(side="left", padx=(8, 0))
+
+        row_btns = ttk.Frame(frm)
+        row_btns.pack(fill="x", pady=(0, 8))
+        ttk.Button(row_btns, text="上移", command=lambda: self._move_todo_item(lb, -1)).pack(side="left")
+        ttk.Button(row_btns, text="下移", command=lambda: self._move_todo_item(lb, 1)).pack(
+            side="left", padx=6)
+
+        def do_delete():
+            sel = lb.curselection()
+            if sel:
+                lb.delete(sel[0])
+
+        ttk.Button(row_btns, text="删除选中", command=do_delete).pack(side="left")
+
+        ttk.Label(frm, text=f"保存在：{todo_list.TODO_FILE}", foreground="#888888",
+                  font=(f, 8)).pack(anchor="w", pady=(0, 8))
+
+        row_ok = ttk.Frame(frm)
+        row_ok.pack(fill="x")
+
+        def do_save():
+            todo_list.save_items([lb.get(i) for i in range(lb.size())])
+            win.destroy()
+            self._status_msg(f"常用工作清单已保存（{lb.size()} 条）")
+
+        ttk.Button(row_ok, text="保存并关闭", command=do_save).pack(side="left")
+        ttk.Button(row_ok, text="取消", command=win.destroy).pack(side="left", padx=8)
+        win.bind("<Return>", lambda e: do_add())
+        ent.focus_set()
+
+    @staticmethod
+    def _move_todo_item(lb, delta):
+        sel = lb.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        j = i + delta
+        if not (0 <= j < lb.size()):
+            return
+        s = lb.get(i)
+        lb.delete(i)
+        lb.insert(j, s)
+        lb.selection_clear(0, "end")
+        lb.selection_set(j)
+        lb.see(j)
 
     # ---------- 数据读写 ----------
 
