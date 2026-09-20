@@ -112,7 +112,8 @@ def make_data(*weeks):
 
 def test_跨周关联_上周进行中下周完成算已完成():
     wa = make_week({"2026-08-17": [item("跨周事项", "进行中")]})
-    wb = make_week({"2026-08-25": [item("跨周事项", "已完成")]})
+    wb = make_week({"2026-08-25": [item("跨周事项", "已完成")]},
+                   workdays=["2026-08-24", "2026-08-25"])
     data = make_data(wa, wb)
     stats, _ = report.collect_stats(wa, data)
     assert stats["merged"] == {("2026-08-17", 0): "2026-08-25"}
@@ -124,12 +125,26 @@ def test_跨周关联_上周进行中下周完成算已完成():
 
 def test_跨周关联_反向注记承接():
     wa = make_week({"2026-08-17": [item("跨周事项", "进行中")]})
-    wb = make_week({"2026-08-25": [item("跨周事项", "已完成")]})
+    wb = make_week({"2026-08-25": [item("跨周事项", "已完成")]},
+                   workdays=["2026-08-24", "2026-08-25"])
     data = make_data(wa, wb)
     stats, _ = report.collect_stats(wb, data)
     assert stats["carried"] == {("2026-08-25", 0): "2026-08-17"}
     assert "承接 2026.08.17，上周" in report.build_html(data, wb)
     assert "（承接 2026.08.17，上周）" in report.build_plain(data, wb)
+
+
+def test_跨周关联_周六起始周注记周距正确():
+    """周起始可为任意星期：周六起始周与常规周的跨周注记按周起始日计算。"""
+    wa = make_week({"2026-09-05": [item("调休事项", "进行中")]})      # 周六起始
+    wb = make_week({"2026-09-14": [item("调休事项", "已完成")]},
+                   workdays=["2026-09-12", "2026-09-14"])             # 下周六起始
+    data = make_data(wa, wb)
+    stats_a, _ = report.collect_stats(wa, data)
+    assert stats_a["merged_week"] == {("2026-09-05", 0): "2026-09-12"}
+    assert "已于 2026.09.14 完成，下周" in report.build_html(data, wa)
+    stats_b, _ = report.collect_stats(wb, data)
+    assert "承接 2026.09.05，上周" in report.build_html(data, wb)
 
 
 def test_跨周关联_不传data时保持只关联同周():

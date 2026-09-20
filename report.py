@@ -60,8 +60,10 @@ _norm = norm_content   # 模块内简写
 # ---------- 跨周关联 ----------
 
 def _later_done_dates(data, week):
-    """跨周关联（正向）：该周之后所有周里出现的「已完成」条目，归一化内容 → 最早完成日期。"""
+    """跨周关联（正向）：该周之后所有周里出现的「已完成」条目，
+    返回 (内容 → 最早完成日期, 内容 → 所在周 key)。"""
     done = {}
+    done_wk = {}
     key = (week or {}).get("start_date") or ""
     weeks = (data or {}).get("weeks") or {}
     for k in sorted(weeks):
@@ -73,12 +75,15 @@ def _later_done_dates(data, week):
                     c = _norm(it.get("content"))
                     if c:
                         done.setdefault(c, d)
-    return done
+                        done_wk.setdefault(c, k)
+    return done, done_wk
 
 
 def _earlier_doing_dates(data, week):
-    """跨周关联（反向）：该周之前所有周里出现的「进行中」条目，归一化内容 → 最早进行中日期。"""
+    """跨周关联（反向）：该周之前所有周里出现的「进行中」条目，
+    返回 (内容 → 最早进行中日期, 内容 → 所在周 key)。"""
     doing = {}
+    doing_wk = {}
     key = (week or {}).get("start_date") or ""
     weeks = (data or {}).get("weeks") or {}
     for k in sorted(weeks):
@@ -90,14 +95,19 @@ def _earlier_doing_dates(data, week):
                     c = _norm(it.get("content"))
                     if c:
                         doing.setdefault(c, d)
-    return doing
+                        doing_wk.setdefault(c, k)
+    return doing, doing_wk
 
 
-def week_gap_label(week, date_str):
-    """日期与周报周之间隔了几周：''（同周）/ '上周' / '下周' / '前 N 周' / '后 N 周'。"""
+def week_gap_label(week, date_str, other_week=None):
+    """日期与周报周之间隔了几周：''（同周）/ '上周' / '下周' / '前 N 周' / '后 N 周'。
+
+    周 = 起始日期起 7 天（起始可为任意星期）。跨周注记时传 other_week（另一周的起始 key）
+    按周起始日精确计算；否则按 date_str 与本周起始日直接相减（同周内差 < 7 天视为同周）。
+    """
     try:
-        wm = storage.monday_of(storage.parse_date((week or {}).get("start_date") or ""))
-        dm = storage.monday_of(storage.parse_date(date_str))
+        wm = storage.parse_date((week or {}).get("start_date") or "")
+        dm = storage.parse_date(other_week if other_week else date_str)
     except ValueError:
         return ""
     gap = (dm - wm).days // 7
@@ -132,7 +142,7 @@ def collect_stats(week, data=None):
         明细注记「承接 X，上周/前 N 周」。
     """
     stats = {"total": 0, "done": 0, "doing": 0, "todo": 0, "diff": 0,
-             "filled": 0, "merged": {}, "carried": {},
+             "filled": 0, "merged": {}, "carried": {}, "merged_week": {}, "carried_week": {},
              "unique": {"total": 0, "done": 0, "doing": 0, "todo": 0}}
     diffs = []
     workdays = week.get("workdays", [])
@@ -144,8 +154,11 @@ def collect_stats(week, data=None):
                 c = _norm(it.get("content"))
                 if c:
                     done_dates.setdefault(c, d)
-    cross_done = _later_done_dates(data, week) if data is not None else {}
-    prev_doing = _earlier_doing_dates(data, week) if data is not None else {}
+    cross_done = cross_done_wk = {}
+    prev_doing = prev_doing_wk = {}
+    if data is not None:
+        cross_done, cross_done_wk = _later_done_dates(data, week)
+        prev_doing, prev_doing_wk = _earlier_doing_dates(data, week)
     # 第二遍：统计；「进行中」条目若同内容在之后某天（同周或更晚的周）已完成 → 归入已完成
     done_unique = 0    # 原状态即「已完成」的条目：同名重复各算一项，不合并
     cross_merged = {}  # 仅跨周收尾（本周无「已完成」记录）的「进行中」：同名合并为一例
@@ -164,12 +177,15 @@ def collect_stats(week, data=None):
                 dd = done_dates.get(c) or cross_done.get(c)
                 if dd and dd > d:  # 完成条目在同周之后或更晚的周（不含同日）
                     stats["merged"][(d, i)] = dd
+                    if c not in done_dates:  # 完成在更晚的周 → 记录所在周 key 用于注记周距
+                        stats["merged_week"][(d, i)] = cross_done_wk.get(c, "")
                     s = "已完成"
                     merged = True
             if s == "已完成" and not merged:
                 st = prev_doing.get(c)
                 if st:  # 之前某周曾「进行中」→ 本周完成行注记承接
                     stats["carried"][(d, i)] = st
+                    stats["carried_week"][(d, i)] = prev_doing_wk.get(c, "")
             if s == "已完成":
                 stats["done"] += 1
             elif s == "进行中":
@@ -272,7 +288,7 @@ def report_title(week):
 
 # ---------- HTML 生成 ----------
 
-def _items_table_html(items, merged, carried, day_key, week):
+def _items_table_html(items, merged, carried, day_key, week, merged_week=None, carried_week=None):
     rows = [
         '<table border="1" cellpadding="6" cellspacing="0" '
         'style="border-collapse:collapse;border-color:#bfbfbf;width:100%;">',
@@ -295,13 +311,13 @@ def _items_table_html(items, merged, carried, day_key, week):
             status_cell = _esc(s)
             done_on = merged.get((day_key, i - 1))
             if done_on:  # 后续已收尾的「进行中」事项：状态加注完成日期（可能在其他周）
-                label = week_gap_label(week, done_on)
+                label = week_gap_label(week, done_on, (merged_week or {}).get((day_key, i - 1)))
                 status_cell += (f'<br><span style="font-weight:normal;color:#595959;'
                                 f'font-size:11px;">已于 {storage.short_date(done_on)} 完成'
                                 + (f"，{label}" if label else "") + '</span>')
             start_on = carried.get((day_key, i - 1))
             if start_on:  # 承接之前周「进行中」的「已完成」事项：加注起始日期
-                label = week_gap_label(week, start_on)
+                label = week_gap_label(week, start_on, (carried_week or {}).get((day_key, i - 1)))
                 status_cell += (f'<br><span style="font-weight:normal;color:#595959;'
                                 f'font-size:11px;">承接 {storage.short_date(start_on)}'
                                 + (f"，{label}" if label else "") + '</span>')
@@ -342,7 +358,8 @@ def build_html(data, week, full_document=False):
         items = storage.peek_day(week, d).get("items", [])
         h.append(f'<p style="margin:12px 0 4px 0;"><b>{storage.format_date(d)}'
                  f'（{storage.weekday_cn(d)}）</b></p>')
-        h.append(_items_table_html(items, stats.get("merged", {}), stats.get("carried", {}), d, week))
+        h.append(_items_table_html(items, stats.get("merged", {}), stats.get("carried", {}), d, week,
+                                   stats.get("merged_week"), stats.get("carried_week")))
 
     h.append('<h3 style="font-size:15px;margin:16px 0 6px 0;">三、难点与问题</h3>')
     if diffs:
@@ -407,11 +424,13 @@ def build_plain(data, week):
                 content = content.replace("\n", "\n    ")  # 续行缩进对齐
                 line = f"{i}. {content} —— {s}"
                 if done_on:  # 后续已收尾的「进行中」事项（可能在其他周）
-                    label = week_gap_label(week, done_on)
+                    label = week_gap_label(week, done_on,
+                                           stats.get("merged_week", {}).get((d, i - 1)))
                     line += f"（已于 {storage.short_date(done_on)} 完成" \
                             + (f"，{label}" if label else "") + "）"
                 if start_on:  # 承接之前周「进行中」的「已完成」事项
-                    label = week_gap_label(week, start_on)
+                    label = week_gap_label(week, start_on,
+                                           stats.get("carried_week", {}).get((d, i - 1)))
                     line += f"（承接 {storage.short_date(start_on)}" \
                             + (f"，{label}" if label else "") + "）"
                 diff = (it.get("difficulty") or "").strip()

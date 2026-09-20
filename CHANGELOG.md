@@ -1,5 +1,32 @@
 # 更新记录
 
+## 2026-09-20 周起始日可任意设置：支持调休周（周六/周日开头）
+
+以前周固定从周一开始，节假日调休（周六上班、周日上班、周二到周日排班）没法按实际工作周排版。
+现在「周设置」的**起始日期可以是任意星期**：
+
+- 起始日期即本周第一天，勾选项按起始日往后 7 天排列，星期名跟随起始日变化；
+- 默认勾选「周一至周五」（按起始日投影），可任意调整；
+- 打开「周设置」编辑已有周时，按该周现有工作日预填勾选，不会误改；
+- 启动定位、跨周跳转、历史记录均按新周模型适配；跨周注记（上周/下周/前 N 周）
+  改为按周起始日精确计算，并记录关联周 key；
+- 数据兼容：旧数据（周一 key）无需迁移，照常使用。
+
+新增/更新 4 个单测（周六起始排班、find_week_key、周距注记、周范围标签），当前 71 个单测全部通过。
+
+修改位置：
+
+- `storage.py`：`make_workdays` 改为「起始日起 7 天」语义；新增 `find_week_key()`；
+  `week_range_label` 无工作日时按起始日起 7 天
+- `dialogs.py`：`open_week_setup` 支持任意起始日、勾选项星期名动态跟随、
+  编辑已有周按现有工作日预填
+- `worklog.py`：`_select_initial_date` / `_setup_week_interactive` 用 `find_week_key` 定位；
+  `_create_default_week` 按周一 key 生成
+- `report.py`：`_later_done_dates` / `_earlier_doing_dates` 同时返回所在周 key；
+  `week_gap_label` 增加 `other_week` 参数按周起始日精确计算；`merged_week` / `carried_week` 传递到明细注记
+- `tests/test_storage.py` / `tests/test_report.py`：新增与更新用例
+- `README.md` / `使用说明.md`：周设置说明更新
+
 ## 2026-09-08 代码分析整改：数据安全加固 + 对话框拆分 + 撤销栈
 
 按代码评审意见做的一轮整改：

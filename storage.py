@@ -267,12 +267,33 @@ def weekday_cn(d):
 
 
 def make_workdays(start_date, weekday_flags):
-    """从 start_date 所在周的周一开始，取勾选的星期，返回日期字符串列表（升序）。
-    weekday_flags: 长度 7 的布尔列表，索引 0 = 周一。
+    """从 start_date（任意星期）当天开始的 7 天里，取勾选的位置，返回日期字符串列表（升序）。
+
+    weekday_flags: 长度 7 的布尔列表，索引 0 = start_date 当天、1 = 次日……6 = 第 7 天。
+    支持以周六/周日等任意星期作为周起始（调休排班）。
     """
-    monday = monday_of(start_date)
-    return [format_date(monday + datetime.timedelta(days=i))
+    start = start_date if isinstance(start_date, datetime.date) else parse_date(start_date)
+    return [format_date(start + datetime.timedelta(days=i))
             for i in range(7) if weekday_flags[i]]
+
+
+def find_week_key(data, date_str):
+    """返回包含该日期的周 key（周 = 起始日期起 7 天，起始可为任意星期）。
+
+    多个周重叠时（如调休周与常规周）取起始日期最晚的那个；没有返回 None。
+    """
+    try:
+        d = parse_date(date_str)
+    except ValueError:
+        return None
+    for key in sorted((data.get("weeks") or {}), reverse=True):
+        try:
+            s = parse_date(key)
+        except ValueError:
+            continue
+        if s <= d <= s + datetime.timedelta(days=6):
+            return key
+    return None
 
 
 # ---------- 数据访问 ----------
@@ -315,8 +336,8 @@ def week_range_label(week):
     wd = week.get("workdays") or []
     if wd:
         return f"{short_date(wd[0])} ~ {short_date(wd[-1])}"
-    monday = monday_of(parse_date(week.get("start_date", format_date(datetime.date.today()))))
-    return f"{short_date(monday)} ~ {short_date(monday + datetime.timedelta(days=6))}"
+    start = parse_date(week.get("start_date", format_date(datetime.date.today())))
+    return f"{short_date(start)} ~ {short_date(start + datetime.timedelta(days=6))}"
 
 
 # ---------- 日志 ----------

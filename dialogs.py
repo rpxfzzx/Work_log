@@ -18,7 +18,10 @@ import todo_list
 # ---------- 周设置对话框 ----------
 
 def open_week_setup(app, default_date=None):
-    """周设置对话框。返回 True 表示已设置，False 表示取消。"""
+    """周设置对话框：以「起始日期」为本周第一天（任意星期，支持调休排班），勾选 7 天中的工作日。
+
+    返回 True 表示已设置，False 表示取消。
+    """
     if default_date is None:
         default_date = (storage.parse_date(app.current_date)
                         if app.current_date else datetime.date.today())
@@ -46,13 +49,17 @@ def open_week_setup(app, default_date=None):
     ttk.Label(row1, text="起始日期：").pack(side="left")
     var_date = tk.StringVar(value=storage.format_date(default_date))
     tk.Entry(row1, textvariable=var_date, width=14, font=(f, 10)).pack(side="left")
-    ttk.Label(row1, text="（自动取该日所在周的周一，格式 YYYY-MM-DD）").pack(side="left", padx=6)
+    ttk.Label(row1, text="（以该日为本周第一天，可填周六/周日，支持调休排班）").pack(side="left", padx=6)
 
-    ttk.Label(frm, text="选择工作日：").pack(anchor="w", pady=(10, 2))
+    ttk.Label(frm, text="选择工作日（起始日往后 7 天）：").pack(anchor="w", pady=(10, 2))
     row2 = ttk.Frame(frm)
     row2.pack(fill="x")
     setup_vars = []
-    defaults = [True, True, True, True, True, False, False]
+    lbl_names = []
+
+    def default_flags(d):
+        """新周默认勾「周一至周五」：把星期投影到起始日后的 7 天。"""
+        return [(d.weekday() + i) % 7 < 5 for i in range(7)]
 
     def update_preview():
         try:
@@ -65,14 +72,40 @@ def open_week_setup(app, default_date=None):
         except (ValueError, AttributeError, tk.TclError):
             lbl_preview.config(text="日期格式无效")
 
-    for i, name in enumerate(storage.WEEKDAY_NAMES):
-        v = tk.BooleanVar(value=defaults[i])
+    def update_labels():
+        """起始日期变化后，7 个勾选项的星期名跟随刷新。"""
+        try:
+            d = storage.parse_date(var_date.get())
+        except ValueError:
+            return
+        for i, lbl in enumerate(lbl_names):
+            lbl.config(text=storage.WEEKDAY_NAMES[(d.weekday() + i) % 7])
+        update_preview()
+
+    # 初始勾选：编辑已存在的周 → 按其工作日还原；新周 → 按「周一至周五」投影默认
+    week_key = app.week_key if (app.week_key and app.week_key in app.data["weeks"]) else ""
+    try:
+        existing = set(app.data["weeks"][week_key].get("workdays", [])) if week_key else set()
+        base = storage.parse_date(week_key) if week_key else default_date
+    except ValueError:
+        existing, base = set(), default_date
+    if week_key:
+        var_date.set(storage.format_date(base))
+    initial = [storage.format_date(base + datetime.timedelta(days=i)) in existing for i in range(7)] \
+        if existing else default_flags(base)
+
+    for i in range(7):
+        v = tk.BooleanVar(value=initial[i])
         v.trace_add("write", lambda *a: update_preview())
-        tk.Checkbutton(row2, text=name, variable=v, font=(f, 10)).pack(side="left", padx=4)
+        lbl = tk.Checkbutton(row2, text="", variable=v, font=(f, 10))
+        lbl.pack(side="left", padx=4)
         setup_vars.append(v)
+        lbl_names.append(lbl)
+
     lbl_preview = ttk.Label(frm, text="", foreground="#1f4e79")
     lbl_preview.pack(anchor="w", pady=(8, 0))
-    update_preview()
+    update_labels()
+    var_date.trace_add("write", lambda *a: update_labels())
 
     def confirm():
         try:
@@ -85,7 +118,7 @@ def open_week_setup(app, default_date=None):
             messagebox.showerror("未选择工作日", "请至少勾选一个工作日。", parent=win)
             return
         wd = storage.make_workdays(d, flags)
-        key = storage.format_date(storage.monday_of(d))
+        key = storage.format_date(d)
         is_new = key not in app.data["weeks"]
         week = app.data["weeks"].setdefault(
             key, {"start_date": key, "workdays": [], "next_week_plan": "", "days": {}})

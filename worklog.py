@@ -251,7 +251,8 @@ class WorkLogApp:
     def _select_initial_date(self, auto_setup):
         """启动时定位到今天；今天所在周未设置则弹周设置（auto_setup 时静默建默认周）。"""
         today = datetime.date.today()
-        key = storage.format_date(storage.monday_of(today))
+        key = storage.find_week_key(self.data, storage.format_date(today)) \
+            or storage.format_date(storage.monday_of(today))
         view = self._locate_view(key, today)
         if view:
             self.week_key = key
@@ -265,7 +266,8 @@ class WorkLogApp:
 
     def _setup_week_interactive(self):
         today = datetime.date.today()
-        key = storage.format_date(storage.monday_of(today))
+        key = storage.find_week_key(self.data, storage.format_date(today)) \
+            or storage.format_date(storage.monday_of(today))
         view = self._locate_view(key, today)
         if view:
             self.week_key = key
@@ -279,7 +281,7 @@ class WorkLogApp:
 
     def _create_default_week(self, key, start_date):
         flags = [True, True, True, True, True, False, False]
-        wd = storage.make_workdays(start_date, flags)
+        wd = storage.make_workdays(key, flags)   # key 即周起始日期（默认周一）
         is_new = key not in self.data["weeks"]
         self.data["weeks"].setdefault(
             key, {"start_date": key, "workdays": wd, "next_week_plan": "", "days": {}})

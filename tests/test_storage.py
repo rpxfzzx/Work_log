@@ -150,11 +150,31 @@ def test_prev_workday可跨周回溯():
 
 def test_make_workdays只取勾选的星期():
     import datetime
-    d = datetime.date(2026, 8, 19)   # 星期三
+    d = datetime.date(2026, 8, 19)   # 星期三（起始日）
     wd = storage.make_workdays(d, [True, False, True, False, True, False, False])
-    assert wd == ["2026-08-17", "2026-08-19", "2026-08-21"]
+    assert wd == ["2026-08-19", "2026-08-21", "2026-08-23"]   # 起始日后的第 1/3/5 天
 
 
-def test_week_range_label无工作日时按整周():
+def test_make_workdays_周六开头调休周():
+    import datetime
+    d = datetime.date(2026, 9, 5)   # 星期六（起始日）
+    wd = storage.make_workdays(d, [True, False, True, True, True, True, True])
+    assert wd == ["2026-09-05", "2026-09-07", "2026-09-08",
+                  "2026-09-09", "2026-09-10", "2026-09-11"]
+
+
+def test_find_week_key_定位任意起始周():
+    data = {"weeks": {
+        "2026-09-07": {"workdays": ["2026-09-07"]},
+        "2026-09-05": {"workdays": ["2026-09-05"]},
+    }}
+    assert storage.find_week_key(data, "2026-09-05") == "2026-09-05"
+    assert storage.find_week_key(data, "2026-09-08") == "2026-09-07"   # 重叠时取起始最晚
+    assert storage.find_week_key(data, "2026-09-12") == "2026-09-07"
+    assert storage.find_week_key(data, "2026-09-14") is None
+    assert storage.find_week_key(data, "不是日期") is None
+
+
+def test_week_range_label无工作日时按起始日起7天():
     assert storage.week_range_label({"start_date": "2026-08-19", "workdays": []}) == \
-        "2026.08.17 ~ 2026.08.23"
+        "2026.08.19 ~ 2026.08.25"
